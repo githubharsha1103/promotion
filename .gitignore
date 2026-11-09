@@ -1,0 +1,35 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db
+.pytest_cache/
+.ruff_cache/
+
+# Telethon session databases, journals, and related account state
+data/sessions/**
+!data/sessions/.gitkeep
+*.session
+*.session-journal
+data/records/**
+!data/records/.gitkeep
+
+# Media, generated exports, backups, and runtime logs stay on the VPS filesystem
+data/media/**
+!data/media/**/.gitkeep
+data/exports/**
+!data/exports/.gitkeep
+data/backups/**
+!data/backups/.gitkeep
+logs/**
+!logs/**/.gitkeep
+
+# Common local secret and key material
+*.pem
+*.key
+secrets/

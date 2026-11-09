@@ -1,0 +1,1 @@
+"""MTProto promotion application package."""
