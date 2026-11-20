@@ -319,8 +319,7 @@ class CampaignExecutionService:
     def scheduled_account_claimed(self, account_id: str) -> bool:
         return str(account_id) in self._scheduled_claims
 
-    @staticmethod
-    def _account_progress(campaign_id: str, account_id: str) -> dict:
+    def _account_progress(self, campaign_id: str, account_id: str) -> dict:
         tasks = [task for task in self.task_records(campaign_id)
                  if str(task.get("account_id")) == str(account_id)]
         return {
