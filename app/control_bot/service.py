@@ -114,6 +114,8 @@ class ControlBotService:
         self._initialized = False
         self._started = False
         self._polling = False
+        self._shutdown_requested = False
+        self._startup_task: asyncio.Task[None] | None = None
         self._expiry_task: asyncio.Task[None] | None = None
         self._auth_flows: dict[tuple[int, int], BotAuthenticationFlow] = {}
         self._active_flow_key: tuple[int, int] | None = None
@@ -126,77 +128,134 @@ class ControlBotService:
         self._suspended_resume_tokens: dict[str, tuple[str, str]] = {}
 
     async def start(self) -> bool:
-        """Start polling; failures leave the FastAPI service available."""
+        """Start one polling supervisor; temporary API failures are retried in the background."""
 
         token = self.settings.control_bot_token.get_secret_value()
         if not token or self.settings.admin_id is None:
             logger.info("Control bot disabled: CONTROL_BOT_TOKEN or ADMIN_ID is not configured")
             return False
 
-        try:
-            application = Application.builder().token(token).build()
-            application.bot_data["control_bot_service"] = self
-            # This handler runs first and stops all processing for unauthorized updates.
-            application.add_handler(TypeHandler(Update, self._authorize_update), group=-100)
-            application.add_handler(CommandHandler("start", self._start_command))
-            application.add_handler(CommandHandler("help", self._help_command))
-            application.add_handler(CommandHandler("status", self._status_command))
-            application.add_handler(CommandHandler("accounts", self._accounts_command))
-            application.add_handler(CommandHandler("account", self._account_command))
-            application.add_handler(CommandHandler("disconnect", self._disconnect_command))
-            application.add_handler(CommandHandler("reconnect", self._reconnect_command))
-            application.add_handler(CommandHandler("removeaccount", self._remove_account_command))
-            application.add_handler(CommandHandler("addaccount", self._add_account_command))
-            application.add_handler(CommandHandler("cancel", self._cancel_command))
-            application.add_handler(CommandHandler("addtarget", self._add_target_command))
-            application.add_handler(CommandHandler("targets", self._targets_command))
-            application.add_handler(CommandHandler("target", self._target_command))
-            application.add_handler(CommandHandler("removetarget", self._remove_target_command))
-            application.add_handler(CommandHandler("uploadsticker", self._upload_sticker_command))
-            application.add_handler(CommandHandler("stickers", self._stickers_command))
-            application.add_handler(CommandHandler("removesticker", self._remove_sticker_command))
-            application.add_handler(CommandHandler("createmessage", self._create_message_command))
-            application.add_handler(CommandHandler("messages", self._messages_command))
-            application.add_handler(CommandHandler("message", self._message_command))
-            application.add_handler(CommandHandler("removemessage", self._remove_message_command))
-            application.add_handler(CommandHandler("createcampaign", self._create_campaign_command))
-            application.add_handler(CommandHandler("campaigns", self._campaigns_command))
-            application.add_handler(CommandHandler("campaign", self._campaign_command))
-            application.add_handler(CommandHandler("deletecampaign", self._delete_campaign_command))
-            application.add_handler(CommandHandler("teststicker", self._test_sticker_command))
-            application.add_handler(CallbackQueryHandler(self._callback_router))
-            application.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, self._authentication_message)
-            )
-            application.add_handler(MessageHandler(filters.Sticker.ALL, self._sticker_upload_message))
-
-            self._application = application
-            await application.initialize()
-            self._initialized = True
-            await application.start()
-            self._started = True
-            if application.updater is None:
-                raise RuntimeError("Polling updater is unavailable")
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            self._polling = True
-            self._expiry_task = asyncio.create_task(self._expire_authentication_flows())
-            logger.info("Control bot polling started")
+        if self._polling or (
+            self._startup_task is not None and not self._startup_task.done()
+        ):
             return True
-        except Exception as exc:
-            logger.error("Control bot startup failed (error=%s)", type(exc).__name__)
-            await self.stop()
-            return False
+        self._shutdown_requested = False
+        self._startup_task = asyncio.create_task(
+            self._start_with_retry(token), name="control-bot-startup",
+        )
+        return True
 
-    async def stop(self) -> None:
-        """Stop polling and discard pending account authentication flows."""
+    def _build_application(self, token: str) -> Application:
+        application = Application.builder().token(token).build()
+        application.bot_data["control_bot_service"] = self
+        # This handler runs first and stops processing for unauthorized updates.
+        application.add_handler(TypeHandler(Update, self._authorize_update), group=-100)
+        application.add_handler(CommandHandler("start", self._start_command))
+        application.add_handler(CommandHandler("help", self._help_command))
+        application.add_handler(CommandHandler("status", self._status_command))
+        application.add_handler(CommandHandler("accounts", self._accounts_command))
+        application.add_handler(CommandHandler("account", self._account_command))
+        application.add_handler(CommandHandler("disconnect", self._disconnect_command))
+        application.add_handler(CommandHandler("reconnect", self._reconnect_command))
+        application.add_handler(CommandHandler("removeaccount", self._remove_account_command))
+        application.add_handler(CommandHandler("addaccount", self._add_account_command))
+        application.add_handler(CommandHandler("cancel", self._cancel_command))
+        application.add_handler(CommandHandler("addtarget", self._add_target_command))
+        application.add_handler(CommandHandler("targets", self._targets_command))
+        application.add_handler(CommandHandler("target", self._target_command))
+        application.add_handler(CommandHandler("removetarget", self._remove_target_command))
+        application.add_handler(CommandHandler("uploadsticker", self._upload_sticker_command))
+        application.add_handler(CommandHandler("stickers", self._stickers_command))
+        application.add_handler(CommandHandler("removesticker", self._remove_sticker_command))
+        application.add_handler(CommandHandler("createmessage", self._create_message_command))
+        application.add_handler(CommandHandler("messages", self._messages_command))
+        application.add_handler(CommandHandler("message", self._message_command))
+        application.add_handler(CommandHandler("removemessage", self._remove_message_command))
+        application.add_handler(CommandHandler("createcampaign", self._create_campaign_command))
+        application.add_handler(CommandHandler("campaigns", self._campaigns_command))
+        application.add_handler(CommandHandler("campaign", self._campaign_command))
+        application.add_handler(CommandHandler("deletecampaign", self._delete_campaign_command))
+        application.add_handler(CommandHandler("teststicker", self._test_sticker_command))
+        application.add_handler(CallbackQueryHandler(self._callback_router))
+        application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self._authentication_message)
+        )
+        application.add_handler(MessageHandler(filters.Sticker.ALL, self._sticker_upload_message))
+        return application
 
-        application = self._application
-        if self._polling and application is not None and application.updater is not None:
+    async def _start_with_retry(self, token: str) -> None:
+        attempt = 0
+        delay = 1.0
+        while not self._shutdown_requested:
             try:
-                await application.updater.stop()
+                application = self._build_application(token)
+                self._application = application
+                await application.initialize()
+                self._initialized = True
+                await application.start()
+                self._started = True
+                if application.updater is None:
+                    raise RuntimeError("Polling updater is unavailable")
+                await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+                self._polling = True
+                self._expiry_task = asyncio.create_task(self._expire_authentication_flows())
+                logger.info("Control bot polling started")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempt += 1
+                logger.warning(
+                    "Control bot startup attempt %d failed; retrying (error=%s)",
+                    attempt, type(exc).__name__,
+                )
+                await self._close_application()
+                if self._shutdown_requested:
+                    return
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise
+                delay = min(60.0, delay * 2)
+
+    async def _close_application(self) -> None:
+        application = self._application
+        if application is None:
+            return
+        updater = application.updater
+        if updater is not None and (self._polling or updater.running):
+            try:
+                await updater.stop()
             except Exception as exc:
                 logger.warning("Control bot polling shutdown failed (error=%s)", type(exc).__name__)
-            self._polling = False
+        self._polling = False
+
+        if self._started or application.running:
+            try:
+                await application.stop()
+            except Exception as exc:
+                logger.warning("Control bot application shutdown failed (error=%s)", type(exc).__name__)
+        self._started = False
+        try:
+            await application.shutdown()
+        except Exception as exc:
+            logger.warning("Control bot resource cleanup failed (error=%s)", type(exc).__name__)
+        self._initialized = False
+        self._application = None
+
+    async def stop(self) -> None:
+        """Stop startup/polling and discard pending account authentication flows."""
+
+        self._shutdown_requested = True
+        startup_task = self._startup_task
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
+            try:
+                await startup_task
+            except asyncio.CancelledError:
+                pass
+        self._startup_task = None
+        await self._close_application()
 
         if self._expiry_task is not None:
             self._expiry_task.cancel()
@@ -220,22 +279,6 @@ class ControlBotService:
                         await self.auth_service.cancel(flow.auth_token)
                     except Exception as exc:
                         logger.warning("Could not clear pending account flow during shutdown (error=%s)", type(exc).__name__)
-
-        if application is None:
-            return
-        if self._started:
-            try:
-                await application.stop()
-            except Exception as exc:
-                logger.warning("Control bot application shutdown failed (error=%s)", type(exc).__name__)
-            self._started = False
-        if self._initialized:
-            try:
-                await application.shutdown()
-            except Exception as exc:
-                logger.warning("Control bot resource cleanup failed (error=%s)", type(exc).__name__)
-            self._initialized = False
-        self._application = None
 
     async def _authorize_update(
         self,

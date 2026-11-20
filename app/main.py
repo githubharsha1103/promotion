@@ -1,6 +1,7 @@
 """FastAPI application entry point."""
 
 from contextlib import asynccontextmanager
+from collections.abc import Awaitable
 import logging
 
 from fastapi import FastAPI
@@ -58,47 +59,63 @@ async def lifespan(application: FastAPI):
     scheduled_reporting = ScheduledReportingService(
         ScheduledReportingRepository(settings.records_dir), campaign_execution, campaign_repository,
     )
-    scheduler_service = SchedulerService(
-        SchedulerRepository(settings.records_dir), campaign_repository, account_repository,
-        campaign_execution, restriction_service, scheduled_reporting,
-    )
     auth_service = TelegramAuthenticationService(client_manager, account_repository)
-    control_bot = ControlBotService(
-        account_repository, auth_service, client_manager, settings, campaign_execution, scheduler_service,
-        scheduled_reporting,
-    )
-    scheduler_service.set_takeover_notifier(control_bot.notify_normal_campaign_suspended)
-    scheduler_service.set_report_notifier(control_bot.deliver_scheduled_report)
-    scheduler_service.set_recovery_notifier(control_bot.notify_scheduler_recovery)
-    restriction_service.set_notifier(control_bot.notify_restriction)
     application.state.telegram_client_manager = client_manager
     application.state.account_repository = account_repository
     application.state.telegram_auth_service = auth_service
     application.state.campaign_execution_service = campaign_execution
-    application.state.scheduler_service = scheduler_service
     application.state.scheduled_reporting_service = scheduled_reporting
-    application.state.control_bot_service = control_bot
+    scheduler_service = None
+    control_bot = None
+    shutdown_errors: list[Exception] = []
     try:
+        await scheduled_reporting.start()
+        scheduler_service = SchedulerService(
+            SchedulerRepository(settings.records_dir), campaign_repository, account_repository,
+            campaign_execution, restriction_service, scheduled_reporting,
+        )
+        control_bot = ControlBotService(
+            account_repository, auth_service, client_manager, settings, campaign_execution,
+            scheduler_service, scheduled_reporting,
+        )
+        scheduler_service.set_takeover_notifier(control_bot.notify_normal_campaign_suspended)
+        scheduler_service.set_report_notifier(control_bot.deliver_scheduled_report)
+        scheduler_service.set_recovery_notifier(control_bot.notify_scheduler_recovery)
+        restriction_service.set_notifier(control_bot.notify_restriction)
+        application.state.scheduler_service = scheduler_service
+        application.state.control_bot_service = control_bot
         restriction_service.load_active()
         await client_manager.reconnect_saved_accounts(account_repository)
         await campaign_execution.recover_interrupted()
         scheduled_reporting.close_orphaned_assignments()
         await scheduler_service.start()
-        try:
-            await control_bot.start()
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "Control bot startup failed; continuing without it (error=%s)", type(exc).__name__
-            )
+        await control_bot.start()
         await scheduler_service.notify_recovery_required()
         yield
     finally:
-        await scheduler_service.stop()
-        await campaign_execution.shutdown()
-        await control_bot.stop()
-        await auth_service.close()
-        await client_manager.disconnect_all()
+        async def stop_component(name: str, operation: Awaitable[None]) -> None:
+            try:
+                await operation
+            except Exception as exc:
+                shutdown_errors.append(exc)
+                logging.getLogger(__name__).error(
+                    "Application component shutdown failed (component=%s, error=%s)",
+                    name, type(exc).__name__,
+                )
+
+        if scheduler_service is not None:
+            await stop_component("scheduler", scheduler_service.stop())
+        await stop_component("campaign_execution", campaign_execution.shutdown())
+        if control_bot is not None:
+            await stop_component("control_bot", control_bot.stop())
+        await stop_component("scheduled_reporting", scheduled_reporting.stop())
+        await stop_component("authentication", auth_service.close())
+        await stop_component("telegram_clients", client_manager.disconnect_all())
         logging.getLogger(__name__).info("Application shutdown")
+        if shutdown_errors:
+            raise RuntimeError(
+                f"Application shutdown failed for {len(shutdown_errors)} component(s)"
+            ) from shutdown_errors[0]
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)

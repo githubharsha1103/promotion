@@ -100,6 +100,8 @@ class SchedulerService:
         self._recovery_notification_guard = asyncio.Lock()
         self._workers: dict[str, tuple[str, asyncio.Task]] = {}
         self._assignment_counts: dict[tuple[str, str], int] = {}
+        self._reconnect_attempts: dict[str, int] = {}
+        self._reconnect_after: dict[str, float] = {}
         self._account_assignment_counts: dict[str, int] = {
             str(account_id): int(count) for account_id, count in (state.get("account_assignment_counts") or {}).items()
         }
@@ -109,6 +111,8 @@ class SchedulerService:
         self._recovery_notifier = None
         self._report_delivery_tasks: set[asyncio.Task] = set()
         self._report_jobs: set[str] = set()
+        self._report_retry_attempts: dict[str, int] = {}
+        self._report_retry_after: dict[str, float] = {}
         if self.reporting_service is not None:
             self.reporting_service.seed_enabled_state(self._enabled)
             self.execution_service.set_scheduled_event_recorder(self.reporting_service.record_event)
@@ -699,13 +703,20 @@ class SchedulerService:
     def _schedule_due_reports(self, now: datetime) -> None:
         if self.reporting_service is None:
             return
-        for report_key, report in list(self._pending_report_records.items()):
-            if report_key and report_key not in self._report_jobs:
+        if any(not task.done() for task in self._report_delivery_tasks):
+            return
+        if self._report_notifier is not None:
+            for report_key, report in list(self._pending_report_records.items()):
+                if not report_key or report_key in self._report_jobs:
+                    continue
+                if time_module.monotonic() < self._report_retry_after.get(report_key, 0):
+                    return
                 self._report_jobs.add(report_key)
                 task = asyncio.create_task(self._claim_and_deliver_report(report, report_key),
                                            name=f"scheduled-report-pending-{report_key[-10:]}")
                 self._report_delivery_tasks.add(task)
                 task.add_done_callback(self._report_delivery_tasks.discard)
+                return
         zone = ZoneInfo(self._settings.timezone)
         local_now = now.astimezone(zone)
         for kind, hour, minute in (("progress", 21, 0), ("final", 3, 15)):
@@ -723,7 +734,7 @@ class SchedulerService:
                         )
                         self._report_delivery_tasks.add(task)
                         task.add_done_callback(self._report_delivery_tasks.discard)
-                    break
+                    return
                 day += timedelta(days=1)
 
     async def _generate_and_deliver_report(self, kind, day, report_key: str) -> None:
@@ -764,6 +775,10 @@ class SchedulerService:
                 self._pending_report_records.pop(report_key, None)
         except Exception as exc:
             self._report_event("scheduler_error", reason=f"report_delivery_{type(exc).__name__}")
+            logger.warning(
+                "Scheduled report delivery background job failed (error=%s)",
+                type(exc).__name__,
+            )
         finally:
             self._report_jobs.discard(report_key)
 
@@ -771,15 +786,29 @@ class SchedulerService:
         try:
             result = await self._report_notifier(report)
             if result is False:
-                self.reporting_service.mark_delivery(str(report["id"]), sent=False,
-                                                     error="control_bot_unavailable")
+                await asyncio.to_thread(
+                    self.reporting_service.mark_delivery, str(report["id"]),
+                    sent=False, error="control_bot_unavailable",
+                )
                 self._pending_report_records[str(report["id"])] = report
+                report_id = str(report["id"])
+                attempts = self._report_retry_attempts.get(report_id, 0) + 1
+                self._report_retry_attempts[report_id] = attempts
+                delay = min(900.0, 30.0 * (2 ** min(attempts - 1, 5)))
+                self._report_retry_after[report_id] = time_module.monotonic() + delay
             else:
-                self.reporting_service.mark_delivery(str(report["id"]), sent=True)
-                self._pending_report_records.pop(str(report["id"]), None)
+                await asyncio.to_thread(
+                    self.reporting_service.mark_delivery, str(report["id"]), sent=True,
+                )
+                report_id = str(report["id"])
+                self._pending_report_records.pop(report_id, None)
+                self._report_retry_attempts.pop(report_id, None)
+                self._report_retry_after.pop(report_id, None)
         except Exception as exc:
-            self.reporting_service.mark_delivery(str(report["id"]), sent=False,
-                                                 error=type(exc).__name__)
+            await asyncio.to_thread(
+                self.reporting_service.mark_delivery, str(report["id"]),
+                sent=False, error=type(exc).__name__,
+            )
             self._pending_report_records.pop(str(report["id"]), None)
             logger.warning("Could not deliver scheduled report (error=%s)", type(exc).__name__)
 
@@ -1028,7 +1057,28 @@ class SchedulerService:
                 if account_id not in accounts:
                     self._record_skip(account_id, "account_not_authenticated")
                     continue
-                if not await manager.is_connected(account_id) or not await manager.is_authorized(account_id):
+                if not await manager.is_connected(account_id):
+                    if time_module.monotonic() < self._reconnect_after.get(account_id, 0):
+                        self._record_skip(account_id, "account_unavailable")
+                        continue
+                    try:
+                        connected = await manager.connect(account_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not reconnect scheduled account (account_id=%s, error=%s)",
+                            account_id, type(exc).__name__,
+                        )
+                        connected = False
+                    if not connected:
+                        attempts = self._reconnect_attempts.get(account_id, 0) + 1
+                        self._reconnect_attempts[account_id] = attempts
+                        delay = min(300.0, _RECONCILE_SECONDS * (2 ** min(attempts - 1, 5)))
+                        self._reconnect_after[account_id] = time_module.monotonic() + delay
+                        self._record_skip(account_id, "account_unavailable")
+                        continue
+                    self._reconnect_attempts.pop(account_id, None)
+                    self._reconnect_after.pop(account_id, None)
+                if not await manager.is_authorized(account_id):
                     self._record_skip(account_id, "account_unavailable")
                     continue
                 viable_pair = False

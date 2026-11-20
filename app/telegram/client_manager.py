@@ -58,7 +58,16 @@ class TelegramClientManager:
         if existing is not None:
             return existing
         api_id, api_hash = self._credentials()
-        client = TelegramClient(str(self._session_path(account_id)), api_id, api_hash)
+        client = TelegramClient(
+            str(self._session_path(account_id)),
+            api_id,
+            api_hash,
+            connection_retries=1,
+            request_retries=self.max_attempts,
+            retry_delay=max(1, int(self.retry_delay)),
+            auto_reconnect=True,
+            use_ipv6=False,
+        )
         self._clients[account_id] = client
         self._locks[account_id] = asyncio.Lock()
         return client
@@ -103,8 +112,11 @@ class TelegramClientManager:
                 except Exception as exc:
                     try:
                         await client.disconnect()
-                    except Exception:
-                        pass
+                    except Exception as disconnect_exc:
+                        logger.warning(
+                            "Telegram account cleanup after connection failure failed (error=%s)",
+                            type(disconnect_exc).__name__,
+                        )
                     logger.warning(
                         "Telegram account connection attempt %d/%d failed (error=%s)",
                         attempt,
@@ -112,7 +124,9 @@ class TelegramClientManager:
                         type(exc).__name__,
                     )
                     if attempt < self.max_attempts:
-                        await asyncio.sleep(self.retry_delay * attempt)
+                        await asyncio.sleep(
+                            min(30.0, max(1.0, self.retry_delay) * (2 ** (attempt - 1)))
+                        )
             return False
 
     async def disconnect(self, account_id: str) -> None:

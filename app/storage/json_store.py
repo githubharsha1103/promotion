@@ -84,6 +84,22 @@ class JsonStore:
             self._write_unlocked(records)
         return saved
 
+    def create_if_absent(self, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Create a record under one lock, returning the existing record if present."""
+        if not isinstance(record, dict):
+            raise TypeError("record must be a dictionary")
+        saved = dict(record)
+        record_id = str(saved.get("id") or uuid.uuid4().hex)
+        saved["id"] = record_id
+        with locked(self.path):
+            records = self._read_unlocked()
+            existing = records.get(record_id)
+            if existing is not None:
+                return existing, False
+            records[record_id] = saved
+            self._write_unlocked(records)
+        return saved, True
+
     def update(
         self,
         record_id: str,

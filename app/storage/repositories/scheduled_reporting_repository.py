@@ -13,15 +13,4 @@ class ScheduledReportingRepository(JsonRepository):
 
     def put_once(self, record: dict) -> tuple[dict, bool]:
         """Create a record once using its stable report/event key."""
-        record_id = str(record["id"])
-        existing = self.get(record_id)
-        if existing is not None:
-            return existing, False
-        try:
-            return self.create(record), True
-        except Exception:
-            # Another coordinator may have written the same stable key.
-            existing = self.get(record_id)
-            if existing is not None:
-                return existing, False
-            raise
+        return self.create_if_absent(record)

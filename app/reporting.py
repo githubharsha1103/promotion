@@ -1,6 +1,7 @@
 """Scheduled-only daily reporting backed by durable JSON event records."""
 
 from datetime import date, datetime, time, timedelta, timezone
+import asyncio
 import logging
 import uuid
 from zoneinfo import ZoneInfo
@@ -18,16 +19,71 @@ class ScheduledReportingService:
         self.execution_service = execution_service
         self.campaign_repository = campaign_repository
         self.timezone_name = timezone_name
+        self._event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        self._event_writer_task: asyncio.Task | None = None
+        self._event_ids: set[str] = set()
+        self._queued_event_ids: set[str] = set()
+
+    async def start(self) -> None:
+        """Load event identities off-loop and start the single persistence worker."""
+        if self._event_writer_task is not None and not self._event_writer_task.done():
+            return
+        records = await asyncio.to_thread(self.repository.list)
+        self._event_ids = {
+            str(item["id"]) for item in records
+            if item.get("record_type") == "event" and item.get("id")
+        }
+        self._event_writer_task = asyncio.create_task(
+            self._write_events(), name="scheduled-report-event-writer",
+        )
+
+    async def stop(self) -> None:
+        """Persist queued events before the application closes."""
+        task = self._event_writer_task
+        if task is None:
+            return
+        await self._event_queue.join()
+        await self._event_queue.put(None)
+        await task
+        self._event_writer_task = None
+
+    async def _write_events(self) -> None:
+        while True:
+            record = await self._event_queue.get()
+            try:
+                if record is None:
+                    return
+                await asyncio.to_thread(self.repository.put_once, record)
+                self._event_ids.add(str(record["id"]))
+            except Exception as exc:
+                logger.warning(
+                    "Could not persist scheduled report event (type=%s, error=%s)",
+                    record.get("event_type", "unknown") if record is not None else "shutdown",
+                    type(exc).__name__,
+                )
+            finally:
+                if record is not None:
+                    self._queued_event_ids.discard(str(record["id"]))
+                self._event_queue.task_done()
 
     def record_event(self, event_type: str, *, identity: str | None = None, **values) -> dict | None:
-        """Persist one execution or scheduler event; telemetry never breaks execution."""
+        """Queue one execution or scheduler event without blocking campaign work."""
         try:
             record_id = str(identity or uuid.uuid4().hex)
             occurred_at = values.pop("occurred_at", datetime.now(timezone.utc).isoformat())
-            return self.repository.put_once({
+            record = {
                 "id": f"event:{record_id}", "record_type": "event", "event_type": event_type,
                 "occurred_at": occurred_at, **values,
-            })[0]
+            }
+            if record["id"] in self._event_ids or record["id"] in self._queued_event_ids:
+                return record
+            if self._event_writer_task is not None and not self._event_writer_task.done():
+                self._queued_event_ids.add(record["id"])
+                self._event_queue.put_nowait(record)
+                return record
+            saved = self.repository.put_once(record)[0]
+            self._event_ids.add(record["id"])
+            return saved
         except Exception as exc:
             logger.warning("Could not persist scheduled report event (type=%s, error=%s)",
                            event_type, type(exc).__name__)
