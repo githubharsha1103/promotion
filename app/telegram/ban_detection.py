@@ -60,7 +60,7 @@ ORDINARY_EMOJI_PATTERN = re.compile(
 )
 
 TASK_COMPLETION_PATTERN = re.compile(
-    r"^\s*🎉\ufe0f?\s*match\s+successful!?\s*$",
+    r"🎉\ufe0f?\s*match\s+successful!?",
     flags=re.IGNORECASE | re.UNICODE,
 )
 
@@ -73,7 +73,7 @@ def is_task_completion_confirmation(value: str) -> bool:
     """Recognize documented completion text regardless of emoji or Unicode formatting."""
 
     normalized = unicodedata.normalize("NFKC", value).strip()
-    if TASK_COMPLETION_PATTERN.fullmatch(normalized):
+    if TASK_COMPLETION_PATTERN.search(normalized):
         return True
     return OTHER_TASK_COMPLETION_PATTERN.search(normalize_text(value)) is not None
 
