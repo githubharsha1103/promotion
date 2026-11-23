@@ -59,16 +59,23 @@ ORDINARY_EMOJI_PATTERN = re.compile(
     flags=re.IGNORECASE | re.UNICODE,
 )
 
-VERIFIED_CONFIRMATION_PATTERN = re.compile(
-    r"(?:\bverified\b|\btask\s+completed\b|\bpoints?\s+(?:added|credited)\b)",
+TASK_COMPLETION_PATTERN = re.compile(
+    r"^\s*🎉\ufe0f?\s*match\s+successful!?\s*$",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+OTHER_TASK_COMPLETION_PATTERN = re.compile(
+    r"(?:\btask\s+completed\b|\bpoints?\s+(?:added|credited)\b)",
 )
 
 
-def is_verified_confirmation(value: str) -> bool:
+def is_task_completion_confirmation(value: str) -> bool:
     """Recognize documented completion text regardless of emoji or Unicode formatting."""
 
-    normalized = normalize_text(value)
-    return VERIFIED_CONFIRMATION_PATTERN.search(normalized) is not None
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if TASK_COMPLETION_PATTERN.fullmatch(normalized):
+        return True
+    return OTHER_TASK_COMPLETION_PATTERN.search(normalize_text(value)) is not None
 
 
 class BanDetectionEngine:
@@ -104,7 +111,7 @@ class BanDetectionEngine:
             async def handle(event) -> None:
                 received_monotonic_ns = time.monotonic_ns()
                 text = event.raw_text or ""
-                confirmation_match = is_verified_confirmation(text)
+                confirmation_match = is_task_completion_confirmation(text)
                 if not event.is_private or event.sender_id is None or event.chat_id != event.sender_id:
                     if confirmation_match:
                         logger.info(
