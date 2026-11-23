@@ -120,6 +120,7 @@ class CampaignExecutionService:
         self._verification_store = JsonStore(campaign_repository.records_dir / "emoji_verification_tasks.json")
         self._verification_events: dict[tuple[str, str, str], asyncio.Event] = {}
         self._verification_confirmed_events: dict[tuple[str, str, str], asyncio.Event] = {}
+        self._verification_registered_monotonic_ns: dict[tuple[str, str, str], int] = {}
 
     def bind_scheduled_promotion_repository(self, repository) -> None:
         """Bind standalone scheduled promotion metadata to the scheduler JSON store."""
@@ -1473,6 +1474,14 @@ class CampaignExecutionService:
         }
         paused_pairs.add(f"{account_id}:{target_id}")
         self._update_campaign(campaign_id, {"verification_paused_pairs": sorted(paused_pairs)})
+        registered_monotonic_ns = time.monotonic_ns()
+        self._verification_registered_monotonic_ns[key] = registered_monotonic_ns
+        logger.info(
+            "Verification pending state registered "
+            "(monotonic_ns=%d, task_state_registered=%s)",
+            registered_monotonic_ns,
+            task is not None,
+        )
         self._refresh_progress(campaign_id, status="running", operation="ordinary emoji verification paused")
         await self._notify_for_verification(campaign_id)
 
@@ -1523,6 +1532,7 @@ class CampaignExecutionService:
                 emoji,
             )
         except Exception as exc:
+            self._verification_registered_monotonic_ns.pop(key, None)
             self._verification_store.update(record_id, {
                 "status": "failed",
                 "failed_at": self._now(),
@@ -1558,6 +1568,7 @@ class CampaignExecutionService:
             "last_error": "confirmation_timeout",
         })
         campaign_id, account_id, target_id = key
+        self._verification_registered_monotonic_ns.pop(key, None)
         task = self._task_for(campaign_id, account_id, target_id)
         if task is not None:
             self._task_store(campaign_id).update(task["id"], {
@@ -1576,10 +1587,11 @@ class CampaignExecutionService:
 
     async def _handle_ordinary_verification_confirmation(
         self, event, account_id: str, target_id: str, text: str,
-        campaign_id: str | None,
+        campaign_id: str | None, received_monotonic_ns: int | None = None,
     ) -> None:
         campaign_id = str(campaign_id or "")
         key = self._verification_key(campaign_id, str(account_id), str(target_id))
+        lookup_started_monotonic_ns = time.monotonic_ns()
         record = self._active_verification_record(campaign_id, str(account_id), str(target_id))
         target = self.targets.get(str(target_id))
         sender_id = getattr(event, "sender_id", None)
@@ -1588,6 +1600,8 @@ class CampaignExecutionService:
         except (TypeError, ValueError):
             expected_bot_id = None
         task = self._task_for(campaign_id, str(account_id), str(target_id))
+        lookup_completed_monotonic_ns = time.monotonic_ns()
+        registered_monotonic_ns = self._verification_registered_monotonic_ns.get(key)
         bot_match = expected_bot_id is not None and sender_id == expected_bot_id
         pending_task_match = bool(
             task is not None
@@ -1596,7 +1610,20 @@ class CampaignExecutionService:
         )
         record_match = record is not None
         logger.info(
-            "Target confirmation correlation (bot_match=%s, pending_task_match=%s, active_record_match=%s)",
+            "Target confirmation correlation "
+            "(received_monotonic_ns=%s, registered_monotonic_ns=%s, "
+            "lookup_started_monotonic_ns=%d, lookup_completed_monotonic_ns=%d, "
+            "receipt_before_registration=%s, bot_match=%s, pending_task_match=%s, "
+            "active_record_match=%s)",
+            received_monotonic_ns,
+            registered_monotonic_ns,
+            lookup_started_monotonic_ns,
+            lookup_completed_monotonic_ns,
+            (
+                received_monotonic_ns < registered_monotonic_ns
+                if received_monotonic_ns is not None and registered_monotonic_ns is not None
+                else None
+            ),
             bot_match,
             pending_task_match,
             record_match,
@@ -1627,6 +1654,7 @@ class CampaignExecutionService:
         self._update_campaign(campaign_id, {"verification_paused_pairs": sorted(paused_pairs)})
         self._verification_events.setdefault(key, asyncio.Event()).clear()
         self._verification_confirmed_events.setdefault(key, asyncio.Event()).set()
+        self._verification_registered_monotonic_ns.pop(key, None)
         self._refresh_progress(campaign_id, status="running", operation="ordinary emoji verification confirmed")
         await self._notify_for_verification(campaign_id)
         logger.info(

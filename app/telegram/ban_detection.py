@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 import re
+import time
 import unicodedata
 import uuid
 
@@ -101,12 +102,34 @@ class BanDetectionEngine:
             active: set[int] = set()
 
             async def handle(event) -> None:
+                received_monotonic_ns = time.monotonic_ns()
+                text = event.raw_text or ""
+                confirmation_match = is_verified_confirmation(text)
                 if not event.is_private or event.sender_id is None or event.chat_id != event.sender_id:
+                    if confirmation_match:
+                        logger.info(
+                            "Incoming confirmation reached Telethon handler "
+                            "(monotonic_ns=%d, route=rejected_non_private)",
+                            received_monotonic_ns,
+                        )
                     return
                 target = targets.get(int(event.sender_id))
-                if target is None or int(event.sender_id) not in active:
+                if target is None:
+                    if confirmation_match:
+                        logger.info(
+                            "Incoming confirmation reached Telethon handler "
+                            "(monotonic_ns=%d, route=rejected_unmapped_sender)",
+                            received_monotonic_ns,
+                        )
                     return
-                text = event.raw_text or ""
+                if int(event.sender_id) not in active:
+                    if confirmation_match:
+                        logger.info(
+                            "Incoming confirmation reached Telethon handler "
+                            "(monotonic_ns=%d, route=rejected_inactive_target)",
+                            received_monotonic_ns,
+                        )
+                    return
                 account, target_key, target_username, callback, campaign_id, verification_callback, confirmation_callback = target
 
                 normalized = normalize_text(text)
@@ -147,16 +170,18 @@ class BanDetectionEngine:
                     )
                     return
 
-                if is_verified_confirmation(text):
+                if confirmation_match:
                     logger.info(
-                        "Incoming target-bot confirmation matched the text parser (handler_available=%s)",
+                        "Incoming confirmation reached Telethon handler "
+                        "(monotonic_ns=%d, text_match=true, route=accepted, handler_available=%s)",
+                        received_monotonic_ns,
                         confirmation_callback is not None,
                     )
                     if confirmation_callback is not None:
                         asyncio.create_task(
                             confirmation_callback(
                                 event, account, target_key, text,
-                                campaign_id,
+                                campaign_id, received_monotonic_ns,
                             )
                         )
 
