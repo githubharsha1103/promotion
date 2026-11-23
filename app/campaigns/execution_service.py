@@ -1500,8 +1500,14 @@ class CampaignExecutionService:
                 "submitted_at": self._now(),
             })
             await matching_button.click()
-            self._verification_store.update(record_id, {"status": "submitted"})
-            if task is not None:
+            record_after_click = self._verification_store.update(
+                record_id,
+                lambda current: (
+                    current if current.get("status") == "verified"
+                    else {**current, "status": "submitted"}
+                ),
+            )
+            if task is not None and record_after_click.get("status") != "verified":
                 self._task_store(campaign_id).update(task["id"], {
                     "verification_state": "awaiting_confirmation",
                     "updated_at": self._now(),
@@ -1577,6 +1583,23 @@ class CampaignExecutionService:
         record = self._active_verification_record(campaign_id, str(account_id), str(target_id))
         if record is None:
             return
+        target = self.targets.get(str(target_id))
+        sender_id = getattr(event, "sender_id", None)
+        try:
+            expected_bot_id = int((target or {}).get("telegram_user_id"))
+        except (TypeError, ValueError):
+            expected_bot_id = None
+        task = self._task_for(campaign_id, str(account_id), str(target_id))
+        if (
+            expected_bot_id is None
+            or sender_id != expected_bot_id
+            or task is None
+            or task.get("status") != "verification_paused"
+            or task.get("verification_state") != "awaiting_confirmation"
+        ):
+            logger.debug("Target task confirmation did not match its bot and pending task")
+            return
+
         now = self._now()
         self._verification_store.update(record["id"], {
             "status": "verified",
@@ -1584,16 +1607,14 @@ class CampaignExecutionService:
             "confirmation_text": text[:500],
             "last_error": None,
         })
-        task = self._task_for(campaign_id, str(account_id), str(target_id))
-        if task is not None:
-            self._task_store(campaign_id).update(task["id"], {
-                "status": "pending",
-                "phase": "idle",
-                "search_started": False,
-                "verification_state": "verified",
-                "last_error": None,
-                "updated_at": now,
-            })
+        self._task_store(campaign_id).update(task["id"], {
+            "status": "pending",
+            "phase": "idle",
+            "search_started": False,
+            "verification_state": "verified",
+            "last_error": None,
+            "updated_at": now,
+        })
         campaign = self.get(campaign_id) or {}
         paused_pairs = {
             str(pair) for pair in (campaign.get("verification_paused_pairs") or [])
@@ -1605,9 +1626,7 @@ class CampaignExecutionService:
         self._refresh_progress(campaign_id, status="running", operation="ordinary emoji verification confirmed")
         await self._notify_for_verification(campaign_id)
         logger.info(
-            "Ordinary emoji verification confirmed (account_id=%s, target=%s)",
-            account_id,
-            target_id,
+            "Target task confirmation matched to a pending account-target task",
         )
 
     async def _notify_for_verification(self, campaign_id: str) -> None:
@@ -1625,6 +1644,7 @@ class CampaignExecutionService:
         self, campaign_id: str, account_id: str, target_id: str,
     ) -> bool:
         key = self._verification_key(campaign_id, account_id, target_id)
+        confirmed_event = self._verification_confirmed_events.setdefault(key, asyncio.Event())
         deadline = asyncio.get_running_loop().time() + 120
         while asyncio.get_running_loop().time() < deadline:
             task = self._task_for(campaign_id, account_id, target_id)
@@ -1632,10 +1652,15 @@ class CampaignExecutionService:
                 state = str(task.get("verification_state") or "")
                 status = str(task.get("status") or "")
                 if state == "verified" and status == "pending":
+                    logger.info("Promotion resume triggered after confirmed target task")
                     return True
                 if status in {"verification_failed", "failed"}:
                     return False
-            await asyncio.sleep(0.25)
+            remaining = deadline - asyncio.get_running_loop().time()
+            try:
+                await asyncio.wait_for(confirmed_event.wait(), timeout=min(0.25, remaining))
+            except asyncio.TimeoutError:
+                continue
         return False
 
     def _raise_if_verification_paused(self, account_id: str, target_id: str, campaign_id: str) -> None:

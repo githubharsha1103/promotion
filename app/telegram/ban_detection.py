@@ -60,8 +60,14 @@ ORDINARY_EMOJI_PATTERN = re.compile(
 
 VERIFIED_CONFIRMATION_PATTERN = re.compile(
     r"(?:\bverified\b|\btask\s+completed\b|\bpoints?\s+(?:added|credited)\b)",
-    flags=re.IGNORECASE | re.UNICODE,
 )
+
+
+def is_verified_confirmation(value: str) -> bool:
+    """Recognize documented completion text regardless of emoji or Unicode formatting."""
+
+    normalized = normalize_text(value)
+    return VERIFIED_CONFIRMATION_PATTERN.search(normalized) is not None
 
 
 class BanDetectionEngine:
@@ -141,14 +147,14 @@ class BanDetectionEngine:
                     )
                     return
 
-                if VERIFIED_CONFIRMATION_PATTERN.search(unicodedata.normalize("NFKC", text)):
-                    if confirmation_callback is not None:
-                        asyncio.create_task(
-                            confirmation_callback(
-                                event, account, target_key, text,
-                                campaign_id,
-                            )
+                if is_verified_confirmation(text) and confirmation_callback is not None:
+                    logger.debug("Target task confirmation received from watched bot")
+                    asyncio.create_task(
+                        confirmation_callback(
+                            event, account, target_key, text,
+                            campaign_id,
                         )
+                    )
 
             client.add_event_handler(handle, events.NewMessage(incoming=True))
             watch = _ClientWatch(client, targets, active, handle)
