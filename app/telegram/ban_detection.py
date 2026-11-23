@@ -147,14 +147,18 @@ class BanDetectionEngine:
                     )
                     return
 
-                if is_verified_confirmation(text) and confirmation_callback is not None:
-                    logger.debug("Target task confirmation received from watched bot")
-                    asyncio.create_task(
-                        confirmation_callback(
-                            event, account, target_key, text,
-                            campaign_id,
-                        )
+                if is_verified_confirmation(text):
+                    logger.info(
+                        "Incoming target-bot confirmation matched the text parser (handler_available=%s)",
+                        confirmation_callback is not None,
                     )
+                    if confirmation_callback is not None:
+                        asyncio.create_task(
+                            confirmation_callback(
+                                event, account, target_key, text,
+                                campaign_id,
+                            )
+                        )
 
             client.add_event_handler(handle, events.NewMessage(incoming=True))
             watch = _ClientWatch(client, targets, active, handle)

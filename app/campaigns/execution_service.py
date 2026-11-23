@@ -1581,8 +1581,6 @@ class CampaignExecutionService:
         campaign_id = str(campaign_id or "")
         key = self._verification_key(campaign_id, str(account_id), str(target_id))
         record = self._active_verification_record(campaign_id, str(account_id), str(target_id))
-        if record is None:
-            return
         target = self.targets.get(str(target_id))
         sender_id = getattr(event, "sender_id", None)
         try:
@@ -1590,14 +1588,20 @@ class CampaignExecutionService:
         except (TypeError, ValueError):
             expected_bot_id = None
         task = self._task_for(campaign_id, str(account_id), str(target_id))
-        if (
-            expected_bot_id is None
-            or sender_id != expected_bot_id
-            or task is None
-            or task.get("status") != "verification_paused"
-            or task.get("verification_state") != "awaiting_confirmation"
-        ):
-            logger.debug("Target task confirmation did not match its bot and pending task")
+        bot_match = expected_bot_id is not None and sender_id == expected_bot_id
+        pending_task_match = bool(
+            task is not None
+            and task.get("status") == "verification_paused"
+            and task.get("verification_state") == "awaiting_confirmation"
+        )
+        record_match = record is not None
+        logger.info(
+            "Target confirmation correlation (bot_match=%s, pending_task_match=%s, active_record_match=%s)",
+            bot_match,
+            pending_task_match,
+            record_match,
+        )
+        if not (bot_match and pending_task_match and record_match):
             return
 
         now = self._now()
@@ -1636,7 +1640,7 @@ class CampaignExecutionService:
 
     async def _refresh_and_notify(self, campaign_id: str) -> None:
         campaign = self.get(campaign_id)
-        for runtime in self._runtimes.values():
+        for runtime in list(self._runtimes.values()):
             if runtime.task is not None:
                 await self._notify(runtime, campaign)
 
