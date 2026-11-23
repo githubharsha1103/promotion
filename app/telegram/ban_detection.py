@@ -1,5 +1,6 @@
 """Event-driven detection of explicit target bot access bans."""
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
@@ -47,9 +48,20 @@ class BanDetectionResult:
 @dataclass
 class _ClientWatch:
     client: object
-    targets_by_bot_id: dict[int, tuple[str, str, str, object, str | None]]
+    targets_by_bot_id: dict[int, tuple[str, str, str, object, str | None, object | None, object | None]]
     active_bot_ids: set[int]
     handler: object
+
+
+ORDINARY_EMOJI_PATTERN = re.compile(
+    r"\btap\s+(?P<emoji>[^\s]+)\s+below\b",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+VERIFIED_CONFIRMATION_PATTERN = re.compile(
+    r"(?:\bverified\b|\btask\s+completed\b|\bpoints?\s+(?:added|credited)\b)",
+    flags=re.IGNORECASE | re.UNICODE,
+)
 
 
 class BanDetectionEngine:
@@ -72,13 +84,14 @@ class BanDetectionEngine:
     def watch_target(
         self, account_id: str, target_id: str, username: str, client, entity,
         on_detected, campaign_id: str | None = None,
+        on_verification=None, on_confirmation=None,
     ) -> None:
         """Associate a resolved bot and activate it for the current campaign cycle."""
 
         client_key = id(client)
         watch = self._watches.get(client_key)
         if watch is None:
-            targets: dict[int, tuple[str, str, str, object, str | None]] = {}
+            targets: dict[int, tuple[str, str, str, object, str | None, object | None, object | None]] = {}
             active: set[int] = set()
 
             async def handle(event) -> None:
@@ -88,34 +101,54 @@ class BanDetectionEngine:
                 if target is None or int(event.sender_id) not in active:
                     return
                 text = event.raw_text or ""
+                account, target_key, target_username, callback, campaign_id, verification_callback, confirmation_callback = target
+
                 normalized = normalize_text(text)
                 matched = next((phrase for phrase, candidate in self._phrases if candidate in normalized), None)
-                if matched is None:
+                if matched is not None:
+                    key = (account, target_key)
+                    if key not in self._detected:
+                        result = BanDetectionResult(
+                            detection_id=uuid.uuid4().hex,
+                            account_id=account,
+                            target_id=target_key,
+                            target_username=target_username,
+                            target_bot_id=int(event.sender_id),
+                            matched_phrase=matched,
+                            message_excerpt=text[:500],
+                            message_id=getattr(event.message, "id", None),
+                            detected_at=datetime.now(timezone.utc).isoformat(),
+                            campaign_id=campaign_id,
+                        )
+                        self._detected[key] = result
+                        logger.warning(
+                            "Target bot access denial detected (account_id=%s, target=%s, phrase=%s)",
+                            account,
+                            target_username,
+                            matched,
+                        )
+                        callback(result)
                     return
-                account, target_key, target_username, callback, campaign_id = target
-                key = (account, target_key)
-                if key in self._detected:
+
+                emoji_match = ORDINARY_EMOJI_PATTERN.search(unicodedata.normalize("NFKC", text))
+                if emoji_match is not None and verification_callback is not None:
+                    emoji = emoji_match.group("emoji").strip()
+                    asyncio.create_task(
+                        verification_callback(
+                            event, account, target_key, target_username, emoji,
+                            campaign_id,
+                        )
+                    )
                     return
-                result = BanDetectionResult(
-                    detection_id=uuid.uuid4().hex,
-                    account_id=account,
-                    target_id=target_key,
-                    target_username=target_username,
-                    target_bot_id=int(event.sender_id),
-                    matched_phrase=matched,
-                    message_excerpt=text[:500],
-                    message_id=getattr(event.message, "id", None),
-                    detected_at=datetime.now(timezone.utc).isoformat(),
-                    campaign_id=campaign_id,
-                )
-                self._detected[key] = result
-                logger.warning(
-                    "Target bot access denial detected (account_id=%s, target=%s, phrase=%s)",
-                    account,
-                    target_username,
-                    matched,
-                )
-                callback(result)
+
+                if VERIFIED_CONFIRMATION_PATTERN.search(unicodedata.normalize("NFKC", text)):
+                    if confirmation_callback is not None:
+                        asyncio.create_task(
+                            confirmation_callback(
+                                event, account, target_key, text,
+                                campaign_id,
+                            )
+                        )
 
             client.add_event_handler(handle, events.NewMessage(incoming=True))
             watch = _ClientWatch(client, targets, active, handle)
@@ -125,6 +158,7 @@ class BanDetectionEngine:
         watch.targets_by_bot_id[bot_id] = (
             str(account_id), str(target_id), str(username).lstrip("@"), on_detected,
             str(campaign_id) if campaign_id is not None else None,
+            on_verification, on_confirmation,
         )
         watch.active_bot_ids.add(bot_id)
 

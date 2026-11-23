@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import time
+import re
+import unicodedata
 from typing import Awaitable, Callable
 import uuid
 
@@ -69,6 +71,10 @@ class _RestrictionCheckUnavailable(Exception):
     """Fail closed when persistent restriction state cannot be read."""
 
 
+class _VerificationPaused(Exception):
+    """Pause only the affected account-target pair for an ordinary emoji task."""
+
+
 class CampaignExecutionService:
     """Run each account's target list sequentially with durable task checkpoints."""
 
@@ -111,6 +117,9 @@ class CampaignExecutionService:
         self._scheduled_event_recorder = None
         self._scheduled_promotion_repository = None
         self._scheduled_task_store = JsonStore(campaign_repository.records_dir / "scheduled_promotion_tasks.json")
+        self._verification_store = JsonStore(campaign_repository.records_dir / "emoji_verification_tasks.json")
+        self._verification_events: dict[tuple[str, str, str], asyncio.Event] = {}
+        self._verification_confirmed_events: dict[tuple[str, str, str], asyncio.Event] = {}
 
     def bind_scheduled_promotion_repository(self, repository) -> None:
         """Bind standalone scheduled promotion metadata to the scheduler JSON store."""
@@ -441,8 +450,13 @@ class CampaignExecutionService:
             records = self.task_records(campaign_id)
             interrupted = [
                 task for task in records
-                if task.get("phase") not in {None, "idle"}
-                and task.get("status") in {"pending", "in_progress", "suspended"}
+                if (
+                    task.get("status") in {"verification_paused", "verification_failed"}
+                    or (
+                        task.get("phase") not in {None, "idle"}
+                        and task.get("status") in {"pending", "in_progress", "suspended"}
+                    )
+                )
             ]
             # Scheduled workers do not own the campaign-level manual status. Recover
             # their persisted task checkpoints too, or an uncertain Telegram operation
@@ -738,13 +752,32 @@ class CampaignExecutionService:
                     self._mark_target_restricted(campaign, account_id, target_id, restriction)
                     continue
 
+                recovery_task = self._task_for(campaign["id"], account_id, target_id)
+                if recovery_task is not None and recovery_task.get("status") == "verification_paused":
+                    self.ban_detection.watch_target(
+                        account_id, target_id, str(target["username"]), client, entity,
+                        self._signal_ban, campaign_id=str(campaign["id"]),
+                        on_verification=self._handle_ordinary_verification,
+                        on_confirmation=self._handle_ordinary_verification_confirmation,
+                    )
+                    try:
+                        await self._wait_for_verification_resolution(
+                            str(campaign["id"]), account_id, target_id,
+                        )
+                    finally:
+                        self.ban_detection.stop_watching_target(client, entity)
+                    recovery_task = self._task_for(campaign["id"], account_id, target_id) or recovery_task
+                    if recovery_task.get("status") in {"verification_paused", "verification_failed"}:
+                        continue
+
                 for cycle in range(int(task.get("next_cycle", 1)), int(campaign["total_cycles"]) + 1):
                     if self._normal_suspension_requested(runtime, account_id):
                         self._suspend_normal_account(campaign, account_id, runtime)
                         return
                     if runtime.stop.is_set() or runtime.pause.is_set():
                         return
-                    if task.get("status") == "restricted":
+                    task = self._task_for(campaign["id"], account_id, target_id) or task
+                    if task.get("status") in {"restricted", "verification_paused", "verification_failed"}:
                         break
                     detected = self.ban_detection.result_for(account_id, target_id)
                     if detected is not None:
@@ -780,6 +813,8 @@ class CampaignExecutionService:
                     self.ban_detection.watch_target(
                         account_id, target_id, str(target["username"]), client, entity,
                         self._signal_ban, campaign_id=str(campaign["id"]),
+                        on_verification=self._handle_ordinary_verification,
+                        on_confirmation=self._handle_ordinary_verification_confirmation,
                     )
                     try:
                         await self._execute_cycle(campaign, task, client, entity, cycle, runtime)
@@ -794,61 +829,111 @@ class CampaignExecutionService:
         account_id = task["account_id"]
         target_id = task["target_id"]
         ban_event = self._ban_events.setdefault((str(account_id), str(target_id)), asyncio.Event())
+        verification_event = self._verification_events.setdefault(
+            (str(campaign_id), str(account_id), str(target_id)), asyncio.Event()
+        )
         username = str((self.targets.get(target_id) or {}).get("username", "unknown"))
         self._set_current(campaign_id, account_id, target_id, cycle, "searching")
-        self._set_task(campaign, account_id, target_id, {
-            "phase": "opening", "current_cycle": cycle, "search_started": False,
-        })
+        current_task = self._task_for(campaign_id, account_id, target_id) or task
+        resume_phase = str(current_task.get("verification_resume_phase") or "search")
         try:
             self._raise_if_banned(account_id, target_id)
-            self._set_task(campaign, account_id, target_id, {
-                "phase": "search_pending", "search_started": True,
-            })
-            await client.send_message(entity, "/search")
-            self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "search")
-            self._raise_if_banned(account_id, target_id)
-            self._set_task(campaign, account_id, target_id, {"phase": "after_search", "search_started": True})
-            self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
-            await self._wait_for_cycle(self.timing.AFTER_SEARCH_SECONDS, ban_event, account_id, target_id)
+            self._raise_if_verification_paused(account_id, target_id, campaign_id)
 
-            sticker_path = self._sticker_path(campaign["sticker_id"])
-            self._set_current(campaign_id, account_id, target_id, cycle, "sending sticker")
-            self._set_task(campaign, account_id, target_id, {"phase": "sticker_pending", "search_started": True})
-            sticker = self.stickers.get(campaign["sticker_id"]) or {}
-            await client.send_file(
-                entity, str(sticker_path),
-                attributes=self._sticker_attributes(sticker, sticker_path),
-            )
-            self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "sticker")
-            self._raise_if_banned(account_id, target_id)
-            self._set_task(campaign, account_id, target_id, {"phase": "after_sticker", "search_started": True})
-            self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
-            await self._wait_for_cycle(self.timing.AFTER_STICKER_SECONDS, ban_event, account_id, target_id)
+            if resume_phase in {"search", "opening", "idle"}:
+                self._set_task(campaign, account_id, target_id, {
+                    "phase": "opening", "current_cycle": cycle, "search_started": False,
+                    "verification_resume_phase": "search",
+                })
+                self._set_task(campaign, account_id, target_id, {
+                    "phase": "search_pending", "search_started": True,
+                })
+                await client.send_message(entity, "/search")
+                self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "search")
+                self._raise_if_banned(account_id, target_id)
+                self._raise_if_verification_paused(account_id, target_id, campaign_id)
+                self._set_task(campaign, account_id, target_id, {
+                    "phase": "after_search", "search_started": True,
+                    "verification_resume_phase": "sticker",
+                })
+                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._wait_for_cycle(
+                    self.timing.AFTER_SEARCH_SECONDS, ban_event, verification_event,
+                    account_id, target_id, campaign_id,
+                )
 
-            rotation_index, promotion_text = await self._reserve_rotation(campaign_id)
-            self._set_task(campaign, account_id, target_id, {
-                "phase": "message_pending", "rotation_index": rotation_index,
-                "search_started": True,
-            })
-            self._set_current(campaign_id, account_id, target_id, cycle, "sending message")
-            await client.send_message(entity, promotion_text)
-            self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "promotion_message")
-            self._raise_if_banned(account_id, target_id)
-            self._set_task(campaign, account_id, target_id, {"phase": "after_message", "search_started": True})
-            self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
-            await self._wait_for_cycle(self.timing.AFTER_TEXT_SECONDS, ban_event, account_id, target_id)
+            if resume_phase in {"search", "opening", "idle", "sticker"}:
+                sticker_path = self._sticker_path(campaign["sticker_id"])
+                self._set_current(campaign_id, account_id, target_id, cycle, "sending sticker")
+                self._set_task(campaign, account_id, target_id, {"phase": "sticker_pending", "search_started": True})
+                sticker = self.stickers.get(campaign["sticker_id"]) or {}
+                await client.send_file(
+                    entity, str(sticker_path),
+                    attributes=self._sticker_attributes(sticker, sticker_path),
+                )
+                self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "sticker")
+                self._raise_if_banned(account_id, target_id)
+                self._raise_if_verification_paused(account_id, target_id, campaign_id)
+                self._set_task(campaign, account_id, target_id, {
+                    "phase": "after_sticker", "search_started": True,
+                    "verification_resume_phase": "message",
+                })
+                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._wait_for_cycle(
+                    self.timing.AFTER_STICKER_SECONDS, ban_event, verification_event,
+                    account_id, target_id, campaign_id,
+                )
 
-            self._set_current(campaign_id, account_id, target_id, cycle, "stopping")
-            self._set_task(campaign, account_id, target_id, {"phase": "stop_pending", "search_started": True})
-            await client.send_message(entity, "/stop")
-            self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "stop")
-            self._raise_if_banned(account_id, target_id)
-            self._set_task(campaign, account_id, target_id, {"phase": "after_stop", "search_started": False})
-            self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
-            await self._wait_for_cycle(self.timing.AFTER_STOP_SECONDS, ban_event, account_id, target_id)
+            if resume_phase in {"search", "opening", "idle", "sticker", "message"}:
+                rotation_index, promotion_text = await self._reserve_rotation(campaign_id)
+                self._set_task(campaign, account_id, target_id, {
+                    "phase": "message_pending", "rotation_index": rotation_index,
+                    "search_started": True,
+                })
+                self._set_current(campaign_id, account_id, target_id, cycle, "sending message")
+                await client.send_message(entity, promotion_text)
+                self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "promotion_message")
+                self._raise_if_banned(account_id, target_id)
+                self._raise_if_verification_paused(account_id, target_id, campaign_id)
+                self._set_task(campaign, account_id, target_id, {
+                    "phase": "after_message", "search_started": True,
+                    "verification_resume_phase": "stop",
+                })
+                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._wait_for_cycle(
+                    self.timing.AFTER_TEXT_SECONDS, ban_event, verification_event,
+                    account_id, target_id, campaign_id,
+                )
+
+            if resume_phase in {"search", "opening", "idle", "sticker", "message", "stop"}:
+                self._set_current(campaign_id, account_id, target_id, cycle, "stopping")
+                self._set_task(campaign, account_id, target_id, {"phase": "stop_pending", "search_started": True})
+                await client.send_message(entity, "/stop")
+                self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "stop")
+                self._raise_if_banned(account_id, target_id)
+                self._raise_if_verification_paused(account_id, target_id, campaign_id)
+                self._set_task(campaign, account_id, target_id, {
+                    "phase": "after_stop", "search_started": False,
+                    "verification_resume_phase": "complete",
+                })
+                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._wait_for_cycle(
+                    self.timing.AFTER_STOP_SECONDS, ban_event, verification_event,
+                    account_id, target_id, campaign_id,
+                )
             self._finish_task(task, success=True)
             await self._notify(runtime, self.get(campaign_id))
             return True
+        except _VerificationPaused:
+            confirmed = await self._wait_for_verification_resolution(
+                campaign_id, account_id, target_id,
+            )
+            if confirmed:
+                return await self._execute_cycle(
+                    campaign, task, client, entity, cycle, runtime,
+                )
+            await self._notify(runtime, self.get(campaign_id))
+            return False
         except _TargetAccessDenied:
             await self._await_restriction_persistence(account_id, target_id)
             restriction = self.ban_detection.result_for(account_id, target_id)
@@ -1040,6 +1125,8 @@ class CampaignExecutionService:
             "successful": int(current.get("successful", 0)) + int(success),
             "failed": int(current.get("failed", 0)) + int(not success),
             "phase": "idle", "search_started": False,
+            "verification_resume_phase": "search",
+            "verification_state": "idle",
             "last_error": error, "status": "complete" if success else "failed",
             "updated_at": self._now(),
         }
@@ -1279,6 +1366,284 @@ class CampaignExecutionService:
         if seconds > 0:
             await asyncio.sleep(seconds)
 
+    @staticmethod
+    def _normalize_emoji(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
+        return "".join(
+            char for char in normalized
+            if unicodedata.category(char) != "Cf" and char not in {"\ufe0e", "\ufe0f"}
+        ).casefold()
+
+    def _verification_key(self, campaign_id: str, account_id: str, target_id: str) -> tuple[str, str, str]:
+        return str(campaign_id), str(account_id), str(target_id)
+
+    def _verification_records(self, campaign_id: str, account_id: str, target_id: str) -> list[dict]:
+        key = self._verification_key(campaign_id, account_id, target_id)
+        return [
+            record for record in self._verification_store.list()
+            if self._verification_key(
+                str(record.get("campaign_id", "")),
+                str(record.get("account_id", "")),
+                str(record.get("target_id", "")),
+            ) == key
+        ]
+
+    def _active_verification_record(self, campaign_id: str, account_id: str, target_id: str) -> dict | None:
+        records = self._verification_records(campaign_id, account_id, target_id)
+        active = [
+            record for record in records
+            if record.get("status") in {"detected", "awaiting_button", "submitted", "awaiting_confirmation"}
+        ]
+        active.sort(key=lambda record: str(record.get("detected_at", "")), reverse=True)
+        return active[0] if active else None
+
+    def _resume_phase_for_task(self, task: dict) -> str:
+        existing = str(task.get("verification_resume_phase") or "").strip()
+        if existing:
+            return existing
+        phase = str(task.get("phase") or "idle")
+        if phase in {"preparing", "opening", "search_pending", "idle", "after_search"}:
+            return "sticker" if phase == "after_search" else "search"
+        if phase in {"sticker_pending", "after_sticker"}:
+            return "message"
+        if phase in {"message_pending", "after_message"}:
+            return "stop"
+        if phase in {"stop_pending", "after_stop"}:
+            return "complete"
+        return "search"
+
+    async def _handle_ordinary_verification(
+        self, event, account_id: str, target_id: str, target_username: str,
+        emoji: str, campaign_id: str | None,
+    ) -> None:
+        campaign_id = str(campaign_id or "")
+        account_id, target_id = str(account_id), str(target_id)
+        if not campaign_id:
+            return
+        key = self._verification_key(campaign_id, account_id, target_id)
+        active = self._active_verification_record(campaign_id, account_id, target_id)
+        if active is not None:
+            return
+
+        message_id = getattr(event.message, "id", None)
+        record_id = f"{campaign_id}:{account_id}:{target_id}:{message_id or uuid.uuid4().hex}"
+        now = self._now()
+        record = {
+            "id": record_id,
+            "campaign_id": campaign_id,
+            "account_id": account_id,
+            "target_id": target_id,
+            "target_username": target_username,
+            "kind": "ordinary_emoji",
+            "emoji": emoji,
+            "message_id": message_id,
+            "status": "detected",
+            "detected_at": now,
+            "submitted_at": None,
+            "confirmed_at": None,
+            "last_error": None,
+        }
+        record, created = self._verification_store.create_if_absent(record)
+        if not created:
+            return
+
+        verification_event = self._verification_events.setdefault(key, asyncio.Event())
+        verification_event.set()
+        confirmed_event = self._verification_confirmed_events.setdefault(key, asyncio.Event())
+        confirmed_event.clear()
+
+        campaign = self.get(campaign_id) or {}
+        task = self._task_for(campaign_id, account_id, target_id)
+        resume_phase = self._resume_phase_for_task(task or {})
+        if task is not None:
+            self._task_store(campaign_id).update(task["id"], {
+                "status": "verification_paused",
+                "phase": "idle",
+                "search_started": False,
+                "verification_state": "awaiting_confirmation",
+                "verification_resume_phase": resume_phase,
+                "verification_emoji": emoji,
+                "suspension_reason": "Ordinary emoji verification",
+                "updated_at": now,
+            })
+
+        paused_pairs = {
+            f"{str(pair)}"
+            for pair in (campaign.get("verification_paused_pairs") or [])
+        }
+        paused_pairs.add(f"{account_id}:{target_id}")
+        self._update_campaign(campaign_id, {"verification_paused_pairs": sorted(paused_pairs)})
+        self._refresh_progress(campaign_id, status="running", operation="ordinary emoji verification paused")
+        await self._notify_for_verification(campaign_id)
+
+        try:
+            get_buttons = getattr(event.message, "get_buttons", None)
+            if get_buttons is None:
+                raise RuntimeError("Target bot message did not expose inline buttons")
+            rows = await get_buttons()
+            matching_button = None
+            target_emoji = self._normalize_emoji(emoji)
+            for row in rows or []:
+                for button in row:
+                    button_text = getattr(button, "text", "")
+                    if self._normalize_emoji(str(button_text)) == target_emoji:
+                        matching_button = button
+                        break
+                if matching_button is not None:
+                    break
+            if matching_button is None:
+                raise RuntimeError("requested emoji button not found")
+
+            self._verification_store.update(record_id, {
+                "status": "awaiting_confirmation",
+                "button_text": str(getattr(matching_button, "text", "")),
+                "submitted_at": self._now(),
+            })
+            await matching_button.click()
+            self._verification_store.update(record_id, {"status": "submitted"})
+            if task is not None:
+                self._task_store(campaign_id).update(task["id"], {
+                    "verification_state": "awaiting_confirmation",
+                    "updated_at": self._now(),
+                })
+            asyncio.create_task(
+                self._timeout_ordinary_verification(record_id, key),
+                name=f"emoji-verification-timeout-{record_id}",
+            )
+            logger.info(
+                "Ordinary emoji verification submitted (account_id=%s, target=%s, emoji=%s)",
+                account_id,
+                target_username,
+                emoji,
+            )
+        except Exception as exc:
+            self._verification_store.update(record_id, {
+                "status": "failed",
+                "failed_at": self._now(),
+                "last_error": type(exc).__name__,
+            })
+            if task is not None:
+                self._task_store(campaign_id).update(task["id"], {
+                    "status": "verification_failed",
+                    "phase": "idle",
+                    "verification_state": "failed",
+                    "last_error": type(exc).__name__,
+                    "updated_at": self._now(),
+                })
+            logger.warning(
+                "Ordinary emoji verification submission failed (account_id=%s, target=%s, error=%s)",
+                account_id,
+                target_username,
+                type(exc).__name__,
+            )
+            await self._notify_for_verification(campaign_id)
+
+    async def _timeout_ordinary_verification(
+        self, record_id: str, key: tuple[str, str, str],
+    ) -> None:
+        await asyncio.sleep(120)
+        record = self._verification_store.get(record_id)
+        if record is None or record.get("status") not in {"detected", "awaiting_button", "submitted", "awaiting_confirmation"}:
+            return
+        now = self._now()
+        self._verification_store.update(record_id, {
+            "status": "timeout",
+            "failed_at": now,
+            "last_error": "confirmation_timeout",
+        })
+        campaign_id, account_id, target_id = key
+        task = self._task_for(campaign_id, account_id, target_id)
+        if task is not None:
+            self._task_store(campaign_id).update(task["id"], {
+                "status": "verification_failed",
+                "phase": "idle",
+                "verification_state": "timeout",
+                "last_error": "confirmation_timeout",
+                "updated_at": now,
+            })
+        logger.warning(
+            "Ordinary emoji verification timed out (account_id=%s, target=%s)",
+            account_id,
+            target_id,
+        )
+        await self._notify_for_verification(campaign_id)
+
+    async def _handle_ordinary_verification_confirmation(
+        self, event, account_id: str, target_id: str, text: str,
+        campaign_id: str | None,
+    ) -> None:
+        campaign_id = str(campaign_id or "")
+        key = self._verification_key(campaign_id, str(account_id), str(target_id))
+        record = self._active_verification_record(campaign_id, str(account_id), str(target_id))
+        if record is None:
+            return
+        now = self._now()
+        self._verification_store.update(record["id"], {
+            "status": "verified",
+            "confirmed_at": now,
+            "confirmation_text": text[:500],
+            "last_error": None,
+        })
+        task = self._task_for(campaign_id, str(account_id), str(target_id))
+        if task is not None:
+            self._task_store(campaign_id).update(task["id"], {
+                "status": "pending",
+                "phase": "idle",
+                "search_started": False,
+                "verification_state": "verified",
+                "last_error": None,
+                "updated_at": now,
+            })
+        campaign = self.get(campaign_id) or {}
+        paused_pairs = {
+            str(pair) for pair in (campaign.get("verification_paused_pairs") or [])
+            if str(pair) != f"{account_id}:{target_id}"
+        }
+        self._update_campaign(campaign_id, {"verification_paused_pairs": sorted(paused_pairs)})
+        self._verification_events.setdefault(key, asyncio.Event()).clear()
+        self._verification_confirmed_events.setdefault(key, asyncio.Event()).set()
+        self._refresh_progress(campaign_id, status="running", operation="ordinary emoji verification confirmed")
+        await self._notify_for_verification(campaign_id)
+        logger.info(
+            "Ordinary emoji verification confirmed (account_id=%s, target=%s)",
+            account_id,
+            target_id,
+        )
+
+    async def _notify_for_verification(self, campaign_id: str) -> None:
+        campaign = self.get(campaign_id)
+        if campaign is not None:
+            await self._refresh_and_notify(campaign_id)
+
+    async def _refresh_and_notify(self, campaign_id: str) -> None:
+        campaign = self.get(campaign_id)
+        for runtime in self._runtimes.values():
+            if runtime.task is not None:
+                await self._notify(runtime, campaign)
+
+    async def _wait_for_verification_resolution(
+        self, campaign_id: str, account_id: str, target_id: str,
+    ) -> bool:
+        key = self._verification_key(campaign_id, account_id, target_id)
+        deadline = asyncio.get_running_loop().time() + 120
+        while asyncio.get_running_loop().time() < deadline:
+            task = self._task_for(campaign_id, account_id, target_id)
+            if task is not None:
+                state = str(task.get("verification_state") or "")
+                status = str(task.get("status") or "")
+                if state == "verified" and status == "pending":
+                    return True
+                if status in {"verification_failed", "failed"}:
+                    return False
+            await asyncio.sleep(0.25)
+        return False
+
+    def _raise_if_verification_paused(self, account_id: str, target_id: str, campaign_id: str) -> None:
+        key = self._verification_key(campaign_id, account_id, target_id)
+        event = self._verification_events.get(key)
+        if event is not None and event.is_set():
+            raise _VerificationPaused
+
     def _signal_ban(self, result: BanDetectionResult) -> None:
         key = (result.account_id, result.target_id)
         self._ban_events.setdefault(key, asyncio.Event()).set()
@@ -1311,17 +1676,32 @@ class CampaignExecutionService:
         self,
         seconds: float,
         ban_event: asyncio.Event,
+        verification_event: asyncio.Event,
         account_id: str,
         target_id: str,
+        campaign_id: str,
     ) -> None:
         if ban_event.is_set():
             self._raise_if_banned(account_id, target_id)
+        if verification_event.is_set():
+            self._raise_if_verification_paused(account_id, target_id, campaign_id)
         if seconds > 0:
             try:
-                await asyncio.wait_for(ban_event.wait(), timeout=seconds)
+                ban_task = asyncio.create_task(ban_event.wait())
+                verification_task = asyncio.create_task(verification_event.wait())
+                done, pending = await asyncio.wait(
+                    {ban_task, verification_task},
+                    timeout=seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
             except asyncio.TimeoutError:
                 return
             self._raise_if_banned(account_id, target_id)
+            if verification_event.is_set():
+                self._raise_if_verification_paused(account_id, target_id, campaign_id)
 
     async def _notify(self, runtime: _Runtime, campaign: dict | None) -> None:
         if runtime.callback is not None and campaign is not None:
