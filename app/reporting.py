@@ -7,6 +7,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from app.storage.repositories.scheduled_reporting_repository import ScheduledReportingRepository
+from app.campaigns.execution_service import SCHEDULED_PROMOTION_ID
 
 
 logger = logging.getLogger(__name__)
@@ -152,19 +153,33 @@ class ScheduledReportingService:
         return [item for item in self.repository.list()
                 if item.get("record_type") == "report" and item.get("delivery_status") == "pending"]
 
-    def build_daily_report(self, kind: str, report_date: date, *, scheduler_enabled: bool) -> dict:
+    def build_daily_report(
+        self, kind: str, report_date: date, *, scheduler_enabled: bool,
+        operating_start: str = "15:00", operating_end: str = "03:00",
+        delivery_time: str | None = None, scheduler_status: str | None = None,
+    ) -> dict:
         """Build a daily report with local-time windows and persist it idempotently."""
         zone = ZoneInfo(self.timezone_name)
+        operating_start_time = self._parse_time(operating_start)
+        operating_end_time = self._parse_time(operating_end)
         if kind == "progress":
-            start_local = datetime.combine(report_date, time(15), zone)
-            end_local = datetime.combine(report_date, time(21), zone)
-            label = "9:00 PM IST progress report"
+            delivery = self._parse_time(delivery_time or "21:00")
+            label_kind = "progress"
         elif kind == "final":
-            start_local = datetime.combine(report_date - timedelta(days=1), time(15), zone)
-            end_local = datetime.combine(report_date, time(3), zone)
-            label = "3:15 AM IST final daily report"
+            delivery = self._parse_time(delivery_time or "03:15")
+            label_kind = "final"
         else:
             raise ValueError("Unknown scheduled report kind")
+        delivery_local = datetime.combine(report_date, delivery, zone)
+        start_date = report_date if delivery >= operating_start_time else report_date - timedelta(days=1)
+        start_local = datetime.combine(start_date, operating_start_time, zone)
+        end_date = start_date + timedelta(days=int(operating_end_time <= operating_start_time))
+        operating_end_local = datetime.combine(end_date, operating_end_time, zone)
+        end_local = min(delivery_local, operating_end_local)
+        label = (
+            f"{delivery_local.strftime('%I:%M %p').lstrip('0')} IST "
+            f"{label_kind} report"
+        )
         start_utc, end_utc = start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
         report_id = f"report:{kind}:{report_date.isoformat()}"
         existing = self.get_report(report_id)
@@ -172,20 +187,26 @@ class ScheduledReportingService:
             return existing
         report = self._build(start_utc, end_utc, scheduler_enabled=scheduler_enabled,
                              title=label, report_id=report_id, kind=kind,
-                             date_key=report_date.isoformat())
+                             date_key=report_date.isoformat(), scheduler_status=scheduler_status)
         return self.repository.put_once(report)[0]
 
-    def build_current_report(self, now: datetime | None = None, *, scheduler_enabled: bool) -> dict:
+    def build_current_report(
+        self, now: datetime | None = None, *, scheduler_enabled: bool,
+        operating_start: str = "15:00", operating_end: str = "03:00",
+        scheduler_status: str | None = None,
+    ) -> dict:
         zone = ZoneInfo(self.timezone_name)
         now_local = (now or datetime.now(zone)).astimezone(zone)
-        if now_local.timetz().replace(tzinfo=None) >= time(15):
-            start_local = datetime.combine(now_local.date(), time(15), zone)
-        else:
-            start_local = datetime.combine(now_local.date() - timedelta(days=1), time(15), zone)
-        end_local = now_local
+        start_time, end_time = self._parse_time(operating_start), self._parse_time(operating_end)
+        start_date = now_local.date() if now_local.timetz().replace(tzinfo=None) >= start_time \
+            else now_local.date() - timedelta(days=1)
+        start_local = datetime.combine(start_date, start_time, zone)
+        end_date = start_date + timedelta(days=int(end_time <= start_time))
+        end_local = min(now_local, datetime.combine(end_date, end_time, zone))
         return self._build(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc),
-                           scheduler_enabled=scheduler_enabled, title="Current scheduled campaign statistics",
-                           report_id=None, kind="current", date_key=None)
+                           scheduler_enabled=scheduler_enabled, title="Promotion operating-window report",
+                           report_id=None, kind="current", date_key=None,
+                           scheduler_status=scheduler_status)
 
     def claim_delivery(self, report_id: str) -> dict | None:
         """Persist an at-most-once delivery claim before contacting Telegram."""
@@ -212,50 +233,61 @@ class ScheduledReportingService:
             "delivery_updated_at": datetime.now(timezone.utc).isoformat(),
         })
 
-    @staticmethod
-    def format_report(report: dict) -> str:
+    def format_report(self, report: dict) -> str:
         stats = report.get("statistics", {})
+        account_workload = stats.get("account_workload", {})
+        accounts = {
+            str(item.get("id")): item
+            for item in self.execution_service.accounts.list()
+            if item.get("id")
+        }
+        account_lines = []
+        for account_id, values in sorted(
+            account_workload.items(),
+            key=lambda item: str(
+                (accounts.get(str(item[0])) or {}).get("name")
+                or (accounts.get(str(item[0])) or {}).get("phone")
+                or "Unnamed account"
+            ).casefold(),
+        ):
+            account = accounts.get(str(account_id), {})
+            name = str(account.get("name") or account.get("phone") or "Unnamed account")
+            account_lines.append(
+                f"• {name}: {values.get('window_completed_cycles', values.get('completed_cycles', 0))} "
+                f"this window · {values.get('lifetime_completed_cycles', 0)} lifetime"
+            )
+        state_names = {
+            "running": "Running", "waiting": "Waiting", "paused": "Paused",
+            "disabled": "Stopped", "stopping": "Stopping",
+            "awaiting_recovery_confirmation": "Awaiting recovery",
+        }
+        current_state = state_names.get(
+            str(report.get("scheduler_status") or ""),
+            "Enabled" if report.get("scheduler_enabled") else "Stopped",
+        )
+        target_names = stats.get("target_usernames", [])
         lines = [
-            report.get("title", "Scheduled campaign report"),
-            f"Window (Asia/Kolkata): {report.get('window_start_local')} to {report.get('window_end_local')}",
-            f"Scheduler: {'enabled' if report.get('scheduler_enabled') else 'disabled'}",
-            f"Scheduled activity: {'yes' if stats.get('scheduled_activity') else 'none'}",
-            f"Distinct accounts used: {stats.get('distinct_accounts_used', 0)}",
-            f"Accounts restricted/unavailable: {stats.get('accounts_restricted_or_unavailable', 0)}",
-            f"Account-level restrictions: {stats.get('account_level_restrictions', 0)}",
-            f"Account-target restrictions: {stats.get('target_restrictions_detected', 0)}",
-            f"Scheduled campaigns executed: {stats.get('scheduled_campaigns_executed', 0)}",
-            f"Campaigns: {', '.join(stats.get('scheduled_campaign_names', [])) or 'none'}",
-            f"Completed cycles: {stats.get('completed_cycles', 0)}",
-            f"Failed cycles: {stats.get('failed_executions', 0)}",
-            f"Failed assignments: {stats.get('failed_assignments', 0)}",
-            f"Interrupted assignments: {stats.get('interrupted_executions', 0)}",
-            f"Suspended scheduled tasks: {stats.get('suspended_tasks', 0)}",
-            f"Unfinished work (cycles): {stats.get('unfinished_cycles', 0)}",
-            f"Telegram operations completed: {stats.get('promotion_activity', 0)}",
-            f"Peak concurrency: {stats.get('peak_concurrency', 0)}",
-            f"Account utilization: {stats.get('account_utilization_percent', 0)}%",
-            f"Telegram flood waits: {stats.get('flood_wait_count', 0)} ({stats.get('platform_wait_seconds', 0)} sec)",
-            f"Other platform waits recorded: {stats.get('other_platform_wait_count', 0)}",
-            f"Scheduler errors: {stats.get('scheduler_errors', 0)}",
+            f"📊 {report.get('title', 'Promotion report')}",
+            f"🕒 {report.get('window_start_local')} – {report.get('window_end_local')}",
+            f"⚙️ Scheduler: {current_state}",
+            f"🔁 Completed cycles: {stats.get('promotion_completed_cycles', stats.get('completed_cycles', 0))} "
+            "this window · "
+            f"{stats.get('lifetime_completed_cycles', 0)} lifetime",
+            f"👥 Account availability: {stats.get('authenticated_accounts', 0)}/"
+            f"{stats.get('total_accounts', 0)} authenticated",
+            f"🔴 Unavailable: {stats.get('unavailable_accounts', 0)}",
+            f"🚫 Restricted: {stats.get('account_level_restrictions', 0)} accounts · "
+            f"{stats.get('target_restrictions_detected', 0)} target pairs · "
+            f"⏳ Rate limited: {stats.get('rate_limited_accounts', 0)}",
+            "📈 Account cycles:",
         ]
-        for account_id, values in stats.get("account_workload", {}).items():
-            lines.append(f"Account {account_id}: {values.get('completed_cycles', 0)} completed cycles, "
-                         f"{values.get('failed_cycles', 0)} failed, {values.get('activity', 0)} operations, "
-                         f"{values.get('active_seconds', 0)} active seconds "
-                         f"({values.get('utilization_percent', 0)}%)")
-        for item in stats.get("skipped_work", []):
-            lines.append(f"Skipped: {item.get('reason')} (account {item.get('account_id', 'n/a')}, "
-                         f"campaign {item.get('campaign_id', 'n/a')})")
-        for item in stats.get("scheduler_error_details", []):
-            lines.append(f"Scheduler error: {item.get('reason')}")
+        if target_names:
+            lines.insert(2, f"🤖 Targets: {', '.join('@' + name for name in target_names)}")
+        lines.extend(account_lines or ["• No account cycle activity recorded."])
         return "\n".join(lines)
 
-    @staticmethod
-    def split_report(report: dict, limit: int = 3900) -> list[str]:
-        return ScheduledReportingService.split_text(
-            ScheduledReportingService.format_report(report), limit,
-        )
+    def split_report(self, report: dict, limit: int = 3900) -> list[str]:
+        return self.split_text(self.format_report(report), limit)
 
     @staticmethod
     def split_text(text: str, limit: int = 3900) -> list[str]:
@@ -271,8 +303,11 @@ class ScheduledReportingService:
             chunks.append(current)
         return chunks or ["No scheduled campaign data is available."]
 
-    def _build(self, start_utc: datetime, end_utc: datetime, *, scheduler_enabled: bool,
-               title: str, report_id: str | None, kind: str, date_key: str | None) -> dict:
+    def _build(
+        self, start_utc: datetime, end_utc: datetime, *, scheduler_enabled: bool,
+        title: str, report_id: str | None, kind: str, date_key: str | None,
+        scheduler_status: str | None = None,
+    ) -> dict:
         events = []
         all_records = self.repository.list()
         for record in all_records:
@@ -303,6 +338,8 @@ class ScheduledReportingService:
         failed_assignments = 0
         scheduler_errors, skipped = [], []
         account_workload = {}
+        promotion_window_by_account: dict[str, int] = {}
+        promotion_completed_cycles = 0
         for event in events:
             kind_name = event.get("event_type")
             account_id = str(event.get("account_id", ""))
@@ -331,6 +368,11 @@ class ScheduledReportingService:
                 campaign_ids.add(str(event.get("campaign_id", "")))
                 row = account_workload.setdefault(account_id, {"completed_cycles": 0, "failed_cycles": 0, "activity": 0})
                 row["completed_cycles"] += 1
+                if str(event.get("campaign_id", "")) == SCHEDULED_PROMOTION_ID:
+                    promotion_completed_cycles += 1
+                    promotion_window_by_account[account_id] = (
+                        promotion_window_by_account.get(account_id, 0) + 1
+                    )
             elif kind_name == "cycle_failed":
                 failed_cycles += 1
                 distinct_accounts.add(account_id)
@@ -374,6 +416,7 @@ class ScheduledReportingService:
         flood_ends = {str(item.get("wait_id")): item for item in all_records
                       if item.get("record_type") == "event" and item.get("event_type") == "flood_wait_completed"}
         flood_count = wait_seconds = 0
+        flood_accounts = set()
         for event in all_records:
             if event.get("record_type") != "event" or event.get("event_type") != "flood_wait":
                 continue
@@ -392,6 +435,8 @@ class ScheduledReportingService:
             if overlap_end > overlap_start:
                 flood_count += 1
                 wait_seconds += int((overlap_end - overlap_start).total_seconds())
+                if event.get("account_id"):
+                    flood_accounts.add(str(event["account_id"]))
 
         intervals = []
         utilization_seconds = {}
@@ -464,6 +509,7 @@ class ScheduledReportingService:
             "accounts_restricted_or_unavailable": len({item for item in restricted_accounts | unavailable_accounts if item}),
             "account_level_restrictions": len({item for item in restricted_accounts if item}),
             "target_restrictions_detected": len(restriction_keys),
+            "unavailable_accounts": len({item for item in unavailable_accounts if item}),
             "scheduled_campaigns_executed": len({item for item in campaign_ids if item}),
             "scheduled_campaign_names": sorted({
                 str(campaigns[item].get("name", item)) if item in campaigns
@@ -471,6 +517,7 @@ class ScheduledReportingService:
                 for item in campaign_ids
             }),
             "completed_cycles": completed_cycles,
+            "promotion_completed_cycles": promotion_completed_cycles,
             "failed_executions": failed_cycles,
             "failed_assignments": failed_assignments,
             "interrupted_executions": len({item for item in interrupted_assignments if item}),
@@ -487,6 +534,39 @@ class ScheduledReportingService:
             "skipped_work": skipped[:40],
             "account_workload": account_workload,
         }
+        target_usernames = []
+        for target_id in sorted({
+            str(item.get("target_id")) for item in events if item.get("target_id")
+        }):
+            target = self.execution_service.targets.get(target_id) or {}
+            if target.get("username"):
+                target_usernames.append(str(target["username"]).lstrip("@"))
+        lifetime_by_account: dict[str, int] = {}
+        for task in self.execution_service.task_records(SCHEDULED_PROMOTION_ID):
+            account_id = str(task.get("account_id", ""))
+            if account_id:
+                lifetime_by_account[account_id] = (
+                    lifetime_by_account.get(account_id, 0)
+                    + max(0, int(task.get("successful", 0)))
+                )
+        account_records = [
+            item for item in self.execution_service.accounts.list()
+            if item.get("id")
+        ]
+        for account in account_records:
+            account_id = str(account["id"])
+            workload = account_workload.setdefault(
+                account_id, {"completed_cycles": 0, "failed_cycles": 0, "activity": 0},
+            )
+            workload["window_completed_cycles"] = promotion_window_by_account.get(account_id, 0)
+            workload["lifetime_completed_cycles"] = lifetime_by_account.get(account_id, 0)
+        stats.update({
+            "lifetime_completed_cycles": sum(lifetime_by_account.values()),
+            "authenticated_accounts": sum(1 for item in account_records if item.get("authenticated") is True),
+            "total_accounts": len(account_records),
+            "rate_limited_accounts": len(flood_accounts),
+            "target_usernames": target_usernames,
+        })
         local_start, local_end = start_utc.astimezone(zone), end_utc.astimezone(zone)
         report = {
             "id": report_id or f"manual:{uuid.uuid4().hex}", "record_type": "report",
@@ -495,12 +575,23 @@ class ScheduledReportingService:
             "window_start_local": local_start.strftime("%Y-%m-%d %I:%M %p %Z"),
             "window_end_local": local_end.strftime("%Y-%m-%d %I:%M %p %Z"),
             "scheduler_enabled": enabled_at_window, "statistics": stats,
+            "scheduler_status": scheduler_status,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "delivery_status": "pending" if report_id else "manual",
         }
         if not report_id:
             report["id"] = f"manual:{uuid.uuid4().hex}"
         return report
+
+    @staticmethod
+    def _parse_time(value: str) -> time:
+        try:
+            hour, minute = (int(part) for part in value.split(":"))
+            if hour not in range(24) or minute not in range(60):
+                raise ValueError
+            return time(hour, minute)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid report time: {value}") from exc
 
     def _unfinished_snapshot(self, events, starts, ends, window_end):
         latest_by_pair = {}

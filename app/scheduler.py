@@ -36,6 +36,8 @@ class SchedulerSettings:
     outside_peak_concurrency_21_50: int = 2
     outside_peak_concurrency_51_plus: int = 3
     peak_concurrency: int = 5
+    progress_report_time: str = "21:00"
+    final_report_time: str = "03:15"
 
 
 class SchedulerService:
@@ -299,9 +301,9 @@ class SchedulerService:
         target = self.execution_service.targets.get(target_id) or {}
         campaigns = self._schedulable_campaigns()
         campaign_ids = {str(item["id"]) for item in campaigns}
-        campaign_names = {str(item["id"]): str(item.get("name") or item["id"])
-                          for item in campaigns}
-        account_ids = sorted({str(value) for item in campaigns for value in item.get("account_ids", [])})
+        account_ids = sorted(
+            str(item.get("id")) for item in self.account_repository.list() if item.get("id")
+        )
         accounts = {str(item.get("id")): item for item in self.account_repository.list()
                     if str(item.get("id")) in set(account_ids)}
         active = {str(account_id): (str(campaign_id), task)
@@ -310,6 +312,7 @@ class SchedulerService:
         all_events = ([item for item in self.reporting_service.repository.list()
                        if item.get("record_type") == "event"]
                       if self.reporting_service is not None else [])
+        scheduled_tasks = self.execution_service.task_records(SCHEDULED_PROMOTION_ID)
         now = datetime.now(ZoneInfo(self._settings.timezone))
         operating_day = self._operating_day(now)
         window_start = datetime.combine(
@@ -321,9 +324,10 @@ class SchedulerService:
         if self._parse_time(self._settings.operating_start) > self._parse_time(self._settings.operating_end):
             window_end += timedelta(days=1)
         effective_end = min(now, window_end)
+        scheduled_campaign_ids = {SCHEDULED_PROMOTION_ID}
         parsed_events = []
         for item in all_events:
-            if str(item.get("campaign_id", "")) not in campaign_ids:
+            if str(item.get("campaign_id", "")) not in scheduled_campaign_ids:
                 continue
             if item.get("target_id") is not None and str(item.get("target_id")) != target_id:
                 continue
@@ -336,53 +340,47 @@ class SchedulerService:
                 continue
             if window_start <= occurred <= effective_end:
                 parsed_events.append({**item, "_occurred": occurred})
-        operations = [item for item in parsed_events
-                      if item.get("event_type") == "telegram_operation"
-                      and str(item.get("target_id", "")) == target_id]
-        operations_by_account: dict[str, int] = {}
-        for item in operations:
-            account_id = str(item.get("account_id", ""))
-            operations_by_account[account_id] = operations_by_account.get(account_id, 0) + 1
-        assignment_starts = {
-            str(item.get("assignment_id")): item for item in all_events
-            if item.get("event_type") == "assignment_started" and item.get("assignment_id")
+        tasks_by_account: dict[str, list[dict]] = {}
+        for task in scheduled_tasks:
+            account_id = str(task.get("account_id", ""))
+            tasks_by_account.setdefault(account_id, []).append(task)
+        lifetime_by_account = {
+            account_id: sum(max(0, int(task.get("successful", 0))) for task in tasks)
+            for account_id, tasks in tasks_by_account.items()
         }
-        assignment_finishes = {
-            str(item.get("assignment_id")): item for item in all_events
-            if item.get("event_type") == "assignment_finished" and item.get("assignment_id")
+        window_by_account: dict[str, int] = {}
+        for event in parsed_events:
+            if event.get("event_type") == "cycle_completed":
+                account_id = str(event.get("account_id", ""))
+                window_by_account[account_id] = window_by_account.get(account_id, 0) + 1
+
+        completed_waits = {
+            str(item.get("wait_id")) for item in all_events
+            if item.get("event_type") == "flood_wait_completed" and item.get("wait_id")
         }
-        window_seconds: dict[str, int] = {}
-        for assignment_id, event in assignment_starts.items():
-            if str(event.get("campaign_id", "")) not in campaign_ids:
+        rate_limited_until: dict[str, datetime] = {}
+        for event in all_events:
+            if event.get("record_type") != "event" or event.get("event_type") != "flood_wait":
                 continue
-            event_tasks = event.get("tasks") or []
-            if event_tasks and not any(str(task.get("target_id")) == target_id for task in event_tasks):
+            wait_id = str(event.get("wait_id", ""))
+            if not wait_id or wait_id in completed_waits:
                 continue
             try:
-                started = datetime.fromisoformat(str(event["occurred_at"]))
-                if started.tzinfo is None:
-                    started = started.replace(tzinfo=timezone.utc)
-                started = started.astimezone(now.tzinfo)
-                finish = assignment_finishes.get(assignment_id)
-                ended = datetime.fromisoformat(str(finish["occurred_at"])) if finish else now
-                if ended.tzinfo is None:
-                    ended = ended.replace(tzinfo=timezone.utc)
-                ended = ended.astimezone(now.tzinfo)
-                duration = max(0, int((min(ended, effective_end) - max(started, window_start)).total_seconds()))
-            except (KeyError, ValueError):
+                wait_start = datetime.fromisoformat(str(event["occurred_at"]))
+                if wait_start.tzinfo is None:
+                    wait_start = wait_start.replace(tzinfo=timezone.utc)
+                until = wait_start.astimezone(now.tzinfo) + timedelta(
+                    seconds=max(0, int(event.get("seconds", 0)))
+                )
+            except (KeyError, ValueError, TypeError):
                 continue
             account_id = str(event.get("account_id", ""))
-            window_seconds[account_id] = window_seconds.get(account_id, 0) + duration
+            if until > now and until > rate_limited_until.get(account_id, now):
+                rate_limited_until[account_id] = until
 
-        tasks_by_account: dict[str, list[dict]] = {}
-        all_tasks = []
-        for campaign in campaigns:
-            for task in self.execution_service.task_records(str(campaign["id"])):
-                if str(task.get("target_id")) != target_id:
-                    continue
-                all_tasks.append(task)
-                tasks_by_account.setdefault(str(task.get("account_id", "")), []).append(task)
-        restricted_pairs = self._restricted_pairs(campaigns)
+        restricted_pairs = self._restricted_pairs([{
+            "account_ids": account_ids, "target_ids": [target_id],
+        }])
         restricted_by_account = {str(item["account_id"]): item for item in restricted_pairs}
         current = self.status()
         eligible = set(str(item) for item in current.get("eligible_account_ids", [])) & set(account_ids)
@@ -394,51 +392,43 @@ class SchedulerService:
             account = accounts.get(account_id) or {}
             tasks = tasks_by_account.get(account_id, [])
             worker = active.get(account_id)
-            phase_task = next((task for task in tasks if task.get("phase") not in {None, "idle"}), None)
             last_error = next((str(task.get("last_error")) for task in sorted(
                 tasks, key=lambda value: str(value.get("updated_at", "")), reverse=True
             ) if task.get("last_error")), None)
             restriction = restricted_by_account.get(account_id)
             if self._recovery_confirmation_required:
                 account_state = "Waiting"
-            elif self._manually_paused:
-                account_state = "Paused"
-            elif worker:
-                account_state = "Running"
             elif restriction:
                 account_state = "Restricted"
+            elif account_id in rate_limited_until:
+                account_state = "Rate Limited"
             elif account.get("authenticated") is not True:
                 account_state = "Unavailable"
             elif not await self.execution_service.client_manager.is_connected(account_id) or not await self.execution_service.client_manager.is_authorized(account_id):
                 account_state = "Unavailable"
-            elif last_error and account_id not in eligible:
-                account_state = "Error"
+            elif self._manually_paused:
+                account_state = "Paused"
+            elif worker:
+                account_state = "Running"
             else:
                 account_state = "Waiting"
-            runtime = self.execution_service._scheduled_runtimes.get(account_id)
-            run_seconds = (max(0, int(time_module.monotonic() - runtime.started_at))
-                           if worker and runtime is not None else None)
             all_account_rows.append({
                 "account_id": account_id,
-                "account_name": str(account.get("name") or account.get("phone") or account_id),
+                "account_name": str(account.get("name") or account.get("phone") or "Unnamed account"),
                 "status": account_state,
-                "campaign_id": worker[0] if worker else None,
-                "campaign_name": campaign_names.get(worker[0]) if worker else None,
-                "completed_cycles": sum(int(task.get("successful", 0)) + int(task.get("failed", 0))
-                                         + int(task.get("restricted", 0)) for task in tasks),
-                "current_cycle": phase_task.get("current_cycle") if phase_task else None,
-                "execution_step": phase_task.get("phase") if phase_task else None,
-                "run_seconds": run_seconds,
-                "window_seconds": window_seconds.get(account_id, 0),
-                "operations": operations_by_account.get(account_id, 0),
+                "completed_cycles": lifetime_by_account.get(account_id, 0),
+                "window_completed_cycles": window_by_account.get(account_id, 0),
                 "last_activity": max((str(task.get("updated_at", "")) for task in tasks), default=None),
-                "last_error": last_error or (restriction.get("status") if restriction else None),
+                "last_error": restriction.get("reason") if restriction else last_error,
+                "rate_limit_seconds": max(
+                    0, int((rate_limited_until[account_id] - now).total_seconds())
+                ) if account_id in rate_limited_until else None,
             })
         account_rows = all_account_rows[page * page_size:(page + 1) * page_size]
-        recent = sorted(parsed_events, key=lambda item: item["_occurred"], reverse=True)[:8]
-        suspended = [{"id": item.get("id"), "name": item.get("name", "Campaign"),
-                      "account_ids": [str(value) for value in item.get("suspended_accounts", [])]}
-                     for item in self.campaign_repository.list() if item.get("suspended_accounts")]
+        state_counts = {
+            state: sum(1 for row in all_account_rows if row["status"] == state)
+            for state in ("Running", "Waiting", "Paused", "Restricted", "Rate Limited", "Unavailable")
+        }
         return {
             "configured": True, "promotion": config, "target_username": target.get("username"),
             "status": current, "accounts": account_rows, "account_page": page,
@@ -448,18 +438,15 @@ class SchedulerService:
                     (self.execution_service.scheduled_promotion_model() or {}).get("sticker_id")
                 )
             ),
-            "eligible_total": len(eligible), "running_accounts": len(active),
-            "idle_accounts": sum(1 for row in all_account_rows if row["status"] == "Waiting"),
-            "completed_cycles": sum(int(task.get("successful", 0)) + int(task.get("failed", 0))
-                                     + int(task.get("restricted", 0)) for task in all_tasks),
-            "total_operations": len(operations),
-            "restricted_accounts": len({str(item["account_id"]) for item in restricted_pairs}),
-            "unavailable_accounts": sum(1 for row in all_account_rows if row["status"] == "Unavailable"),
+            "eligible_total": len(eligible), "running_accounts": state_counts["Running"],
+            "idle_accounts": state_counts["Waiting"],
+            "paused_accounts": state_counts["Paused"],
+            "completed_cycles": sum(max(0, int(task.get("successful", 0))) for task in scheduled_tasks),
+            "window_completed_cycles": sum(window_by_account.values()),
+            "restricted_accounts": state_counts["Restricted"],
+            "rate_limited_accounts": state_counts["Rate Limited"],
+            "unavailable_accounts": state_counts["Unavailable"],
             "restricted_pairs": restricted_pairs,
-            "recent_activity": [{"event_type": item.get("event_type"), "account_id": item.get("account_id"),
-                                 "reason": item.get("reason"), "occurred_at": item.get("occurred_at")}
-                                for item in recent],
-            "suspended_campaigns": suspended,
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
         }
@@ -476,10 +463,14 @@ class SchedulerService:
             raise ValueError(f"Unknown scheduler setting: {sorted(unknown)[0]}")
         settings = SchedulerSettings(**values)
         self._validate_settings(settings)
-        self._settings = settings
         self.repository.save_config(asdict(settings))
+        self._settings = settings
         self._wake.set()
         return settings
+
+    def restore_default_settings(self) -> SchedulerSettings:
+        """Restore the scheduler's built-in defaults and persist them as one update."""
+        return self.update_settings(**asdict(SchedulerSettings()))
 
     def set_campaign_enabled(self, campaign_id: str, enabled: bool) -> dict:
         campaign = self.campaign_repository.get(str(campaign_id))
@@ -651,7 +642,7 @@ class SchedulerService:
 
     def _account_name(self, account_id: str) -> str:
         account = self.account_repository.get(account_id) or {}
-        return str(account.get("name") or account.get("phone") or account_id)
+        return str(account.get("name") or account.get("phone") or "Unnamed account")
 
     def _operating_day(self, now: datetime):
         local = now.astimezone(ZoneInfo(self._settings.timezone))
@@ -719,7 +710,12 @@ class SchedulerService:
                 return
         zone = ZoneInfo(self._settings.timezone)
         local_now = now.astimezone(zone)
-        for kind, hour, minute in (("progress", 21, 0), ("final", 3, 15)):
+        for kind, setting_name in (
+            ("progress", "progress_report_time"),
+            ("final", "final_report_time"),
+        ):
+            report_time = self._parse_time(getattr(self._settings, setting_name))
+            hour, minute = report_time.hour, report_time.minute
             last_day = self._report_last_days.get(kind)
             day = last_day + timedelta(days=1) if last_day else self._report_first_day
             while day <= local_now.date():
@@ -729,7 +725,10 @@ class SchedulerService:
                     if report_key not in self._report_jobs:
                         self._report_jobs.add(report_key)
                         task = asyncio.create_task(
-                            self._generate_and_deliver_report(kind, day, report_key),
+                            self._generate_and_deliver_report(
+                                kind, day, report_key,
+                                delivery_time=f"{hour:02d}:{minute:02d}",
+                            ),
                             name=f"scheduled-report-{kind}-{day.isoformat()}",
                         )
                         self._report_delivery_tasks.add(task)
@@ -737,11 +736,17 @@ class SchedulerService:
                     return
                 day += timedelta(days=1)
 
-    async def _generate_and_deliver_report(self, kind, day, report_key: str) -> None:
+    async def _generate_and_deliver_report(
+        self, kind, day, report_key: str, *, delivery_time: str,
+    ) -> None:
         try:
             report = await asyncio.to_thread(
                 self.reporting_service.build_daily_report, kind, day,
                 scheduler_enabled=self._enabled,
+                operating_start=self._settings.operating_start,
+                operating_end=self._settings.operating_end,
+                delivery_time=delivery_time,
+                scheduler_status=self._state.value,
             )
             last_day = self._report_last_days.get(kind)
             self._report_last_days[kind] = day if last_day is None else max(last_day, day)
@@ -1133,8 +1138,11 @@ class SchedulerService:
                         restriction = {"status": "unknown"}
                     if restriction is not None:
                         key = (str(account_id), str(target_id))
-                        pairs_by_key[key] = {"account_id": key[0], "target_id": key[1],
-                                             "status": restriction.get("status", "restricted")}
+                        pairs_by_key[key] = {
+                            "account_id": key[0], "target_id": key[1],
+                            "status": restriction.get("status", "restricted"),
+                            "reason": restriction.get("detection_reason") or restriction.get("reason"),
+                        }
         return list(pairs_by_key.values())
 
     def _update_snapshot(self, period: str, eligible: list[str], running: list[str], idle: list[str],
@@ -1158,10 +1166,14 @@ class SchedulerService:
         end = self._parse_time(self._settings.operating_end)
         peak_start = self._parse_time(self._settings.peak_start)
         peak_end = self._parse_time(self._settings.peak_end)
-        active = local_time >= start or local_time < end if start > end else start <= local_time < end
+        active = self._time_in_window(local_time, start, end)
         if not active:
             return "inactive"
-        return "peak" if peak_start <= local_time < peak_end else "outside_peak"
+        return "peak" if self._time_in_window(local_time, peak_start, peak_end) else "outside_peak"
+
+    @staticmethod
+    def _time_in_window(value: time, start: time, end: time) -> bool:
+        return (value >= start or value < end) if start > end else start <= value < end
 
     def _next_transition(self, now: datetime) -> datetime:
         candidates = []
@@ -1224,7 +1236,11 @@ class SchedulerService:
             ZoneInfo(settings.timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValueError("Invalid scheduler timezone") from exc
-        for name in ("operating_start", "operating_end", "peak_start", "peak_end"):
+        minute_values = {}
+        for name in (
+            "operating_start", "operating_end", "peak_start", "peak_end",
+            "progress_report_time", "final_report_time",
+        ):
             value = getattr(settings, name)
             try:
                 hour, minute = (int(part) for part in value.split(":"))
@@ -1232,8 +1248,22 @@ class SchedulerService:
                 raise ValueError(f"Invalid time for {name}") from exc
             if hour not in range(24) or minute not in range(60):
                 raise ValueError(f"Invalid time for {name}")
+            minute_values[name] = hour * 60 + minute
         if not (1 <= settings.outside_peak_concurrency_1_20 <= 20
                 and 1 <= settings.outside_peak_concurrency_21_50 <= 50
                 and 1 <= settings.outside_peak_concurrency_51_plus
                 and 1 <= settings.peak_concurrency <= 5):
             raise ValueError("Scheduler concurrency settings are outside supported limits")
+        operating_duration = (
+            minute_values["operating_end"] - minute_values["operating_start"]
+        ) % (24 * 60)
+        peak_duration = (minute_values["peak_end"] - minute_values["peak_start"]) % (24 * 60)
+        peak_offset = (
+            minute_values["peak_start"] - minute_values["operating_start"]
+        ) % (24 * 60)
+        if (
+            operating_duration == 0 or peak_duration == 0
+            or peak_offset >= operating_duration
+            or peak_offset + peak_duration > operating_duration
+        ):
+            raise ValueError("Peak hours must fall entirely within operating hours")

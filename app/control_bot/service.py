@@ -1,14 +1,16 @@
 """Owner-only Telegram Bot API control and account enrollment interface."""
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import re
 import secrets
 import uuid
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -31,6 +33,7 @@ from app.storage.repositories.sticker_repository import StickerRepository
 from app.storage.repositories.target_repository import TargetRepository
 from app.storage.repositories.restriction_repository import RestrictionRepository
 from app.storage.file_manager import FileManager
+from app.storage.json_store import JsonStoreError
 from app.telegram.auth_service import AuthenticationFlowError, TelegramAuthenticationService
 from app.telegram.client_manager import TelegramClientManager
 
@@ -357,15 +360,17 @@ class ControlBotService:
         except Exception as exc:
             logger.warning("Could not read account label for owner restriction notification (error=%s)", type(exc).__name__)
             account = {}
-        account_label = str(account.get("name") or account.get("phone") or account_id)
+        account_label = str(account.get("name") or account.get("phone") or "Unnamed account")
+        detected_at = self._format_dashboard_datetime(
+            restriction.get("detected_at") or restriction.get("created_at")
+        )
         text = (
-            "Account-target restriction detected\n"
+            "🚫 Promotion restriction detected\n"
             f"Account: {account_label}\n"
-            f"Target bot: @{restriction.get('target_username', 'unknown')} "
-            f"(ID: {restriction.get('target_bot_id', 'unavailable')})\n"
+            f"Target: @{str(restriction.get('target_username') or 'unknown').lstrip('@')}\n"
             f"Reason: {restriction.get('detection_reason', 'Access denied')}\n"
-            f"Matched phrase: {restriction.get('matched_phrase', 'unavailable')}\n"
-            f"Detected at: {restriction.get('detected_at', 'unknown')}"
+            f"Status: {str(restriction.get('status') or 'active').title()}"
+            + (f"\nDetected: {detected_at}" if detected_at else "")
         )
         await self._application.bot.send_message(chat_id=self.settings.admin_id, text=text)
 
@@ -376,20 +381,14 @@ class ControlBotService:
         account_id = str(detail.get("account_id", ""))
         campaign = detail.get("campaign") or {}
         account = self.account_repository.get(account_id) or {}
-        label = str(account.get("name") or account.get("phone") or "Unknown account")
+        label = str(account.get("name") or account.get("phone") or "Unnamed account")
         progress = detail.get("progress") or {}
-        cycle_progress = ", ".join(
-            f"target {target_id}: next cycle {cycle}"
-            for target_id, cycle in (progress.get("next_cycles") or {}).items()
-        ) or "No cycle checkpoint was started"
         text = (
-            "Normal campaign suspended for scheduled priority\n"
-            f"Account: {label} (ID: {account_id})\n"
-            f"Campaign: {campaign.get('name', 'Unknown campaign')} (ID: {campaign.get('id', 'unknown')})\n"
+            "⏸️ Normal campaign paused for scheduled promotion\n"
+            f"Account: {label}\n"
+            f"Campaign: {campaign.get('name', 'Campaign')}\n"
             "Reason: Scheduled campaign requires this account.\n"
-            f"Saved progress: {progress.get('successful', 0)} successful, "
-            f"{progress.get('failed', 0)} failed, {progress.get('restricted', 0)} restricted.\n"
-            f"Checkpoint: {cycle_progress}\n"
+            f"Completed cycles saved: {progress.get('successful', 0)}.\n"
             "This account is needed for scheduled promotion. Please use another account for your normal campaign."
         )
         await self._application.bot.send_message(chat_id=self.settings.admin_id, text=text)
@@ -408,19 +407,12 @@ class ControlBotService:
         ]
         for item in assignments:
             progress = item.get("progress") or {}
-            saved_cycles = list((progress.get("next_cycles") or {}).items())
-            cycles = ", ".join(
-                f"target {target}: cycle {cycle}"
-                for target, cycle in saved_cycles[:12]
-            ) or "no cycle checkpoint"
-            if len(saved_cycles) > 12:
-                cycles += f", and {len(saved_cycles) - 12} more targets"
+            account_id = str(item.get("account_id") or "")
+            account = self.account_repository.get(account_id) or {}
+            account_name = str(account.get("name") or account.get("phone") or "Unnamed account")
             lines.append(
-                f"- {item.get('campaign_name', 'Unknown campaign')} (ID {item.get('campaign_id', 'unknown')})\n"
-                f"  Assignment: {item.get('assignment_id') or 'unknown'}\n"
-                f"  Account: {item.get('account_name', item.get('account_id'))} (ID {item.get('account_id')})\n"
-                f"  Saved: {progress.get('successful', 0)} successful, {progress.get('failed', 0)} failed, "
-                f"{progress.get('restricted', 0)} restricted; {cycles}"
+                f"• {item.get('campaign_name', 'Promotion')} · {account_name}\n"
+                f"  Completed cycles saved: {progress.get('successful', 0)}"
             )
         lines.append("Choose whether to resume eligible scheduled work or keep the scheduler stopped.")
         keyboard = InlineKeyboardMarkup([[
@@ -471,115 +463,347 @@ class ControlBotService:
         minutes, seconds = divmod(remainder, 60)
         return f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
 
+    @staticmethod
+    def _format_dashboard_time(value: str) -> str:
+        hour, minute = (int(part) for part in str(value).split(":"))
+        return datetime(2000, 1, 1, hour, minute).strftime("%I:%M %p").lstrip("0")
+
+    @staticmethod
+    def _format_dashboard_datetime(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            stamp = datetime.fromisoformat(str(value))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            local = stamp.astimezone(ZoneInfo("Asia/Kolkata"))
+        except (TypeError, ValueError):
+            return None
+        return f"{local.strftime('%d %b %Y')} · {local.strftime('%I:%M %p').lstrip('0')} IST"
+
+    @staticmethod
+    async def _edit_dashboard_message(query, text: str, reply_markup=None) -> None:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).casefold():
+                raise
+
     async def _show_promotion_dashboard(self, query, page: int = 0, *, refresh: bool = False) -> None:
         if self.scheduler_service is None or query.message is None:
-            await query.edit_message_text("Promotion scheduling is unavailable.")
+            await self._edit_dashboard_message(query, "Promotion scheduling is unavailable.")
             return
         data = (await self.scheduler_service.refresh_promotion_dashboard_data(page)
                 if refresh else await self.scheduler_service.promotion_dashboard_data(page))
         if not data.get("configured"):
-            buttons = [[InlineKeyboardButton("Configure Promotion", callback_data="promo:configure")]]
-            buttons.append([InlineKeyboardButton("\U0001F504 Refresh Dashboard", callback_data="promo:refresh")])
-            await query.edit_message_text(
-                "Promotion not configured\n\nConfigure a promotion name and an opted-in target bot to begin.",
-                reply_markup=self._dashboard_navigation(InlineKeyboardMarkup(buttons), query.message.chat_id,
-                                                        back_data="dash:home"),
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📝 Configure Promotion", callback_data="promo:configure")],
+                [InlineKeyboardButton("⚙️ Settings", callback_data="promo:settings")],
+                [InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="promo:refresh")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="dash:home"),
+                 InlineKeyboardButton("🏠 Home", callback_data="dash:home")],
+            ])
+            await self._edit_dashboard_message(
+                query,
+                "🚀 Promotion Dashboard\n\nNo promotion is configured yet.",
+                reply_markup=markup,
             )
             return
         status = data["status"]
         settings = status["settings"]
+        target_username = str(data.get("target_username") or "unavailable").lstrip("@")
         if status.get("recovery_required"):
-            state = "Awaiting Recovery Confirmation"
+            state = "Awaiting recovery confirmation"
         elif status.get("manually_paused"):
             state = "Paused"
+        elif not status.get("enabled"):
+            state = "Stopped"
         elif data.get("running_accounts"):
             state = "Running"
         elif status.get("operating_period") == "inactive" and status.get("enabled"):
-            state = "Outside Operating Hours"
+            state = "Waiting for operating hours"
         else:
-            state = "Ready"
-        period = str(status.get("operating_period", "inactive")).replace("_", " ").title()
-        running_ids = status.get("running_scheduled_accounts", [])
-        running_lines = []
-        for account_id in running_ids:
-            row = next((item for item in data["accounts"] if item["account_id"] == str(account_id)), None)
-            running_lines.append(row["account_name"] + f" ({account_id})" if row else str(account_id))
-        account_lines = []
-        for row in data["accounts"]:
-            account_lines.append(
-                f"{row['account_name']} (ID {row['account_id']}) — {row['status']} — @{data.get('target_username', 'unknown')}\n"
-                f"  Assignment: {row.get('campaign_name') or '—'} (ID {row.get('campaign_id') or '—'})\n"
-                f"  Cycles {row['completed_cycles']}; current cycle {row.get('current_cycle') or '—'}; "
-                f"step {row.get('execution_step') or '—'}\n"
-                f"  Current run {self._format_duration(row.get('run_seconds'))}; "
-                f"window work {self._format_duration(row.get('window_seconds'))}; "
-                f"operations {row.get('operations', 0)}; last activity {row.get('last_activity') or '—'}"
-                + (f"; reason {row['last_error']}" if row.get("last_error") else "")
-            )
+            state = "Waiting"
+        period_names = {
+            "peak": "Peak",
+            "outside_peak": "Off-Peak",
+            "inactive": "Outside Operating Hours",
+        }
+        period = period_names.get(str(status.get("operating_period")), "Outside Operating Hours")
         lines = [
-            f"\U0001F680 Promotion Dashboard — {data['promotion'].get('name', 'Promotion')}",
-            f"Target bot: @{data.get('target_username') or 'unavailable'} (ID {data['promotion'].get('target_id')})",
-            f"State: {state}",
-            f"Operating period: {period}",
-            f"Operating hours: {settings['operating_start']}–{settings['operating_end']} IST; "
-            f"peak: {settings['peak_start']}–{settings['peak_end']} IST",
-            f"Eligible accounts: {data['eligible_total']} / {data['account_count']}; "
-            f"maximum concurrency: {status.get('maximum_concurrency', 0)}",
-            f"Running accounts: {data['running_accounts']}; idle/waiting: {data['idle_accounts']}",
-            f"Completed cycles: {data['completed_cycles']}; promotion operations this window: {data['total_operations']}",
-            f"Restricted accounts: {data['restricted_accounts']}; unavailable accounts: {data['unavailable_accounts']}",
+            f"🚀 {data['promotion'].get('name', 'Promotion')}",
+            f"🤖 Target: @{target_username}",
+            f"⚙️ Status: {state}",
+            f"🕒 Period: {period}",
+            f"🔁 Cycles: {data['window_completed_cycles']} this window · "
+            f"{data['completed_cycles']} lifetime",
+            f"👥 Accounts: {data['account_count']} total · {data['eligible_total']} eligible",
+            f"🟢 Running {data['running_accounts']} · 🟡 Waiting {data['idle_accounts']}",
+            f"🚫 Restricted {data['restricted_accounts']} · ⏳ Rate limited {data['rate_limited_accounts']}",
+            f"🔴 Unavailable {data['unavailable_accounts']}",
+            f"🕰 Hours: {self._format_dashboard_time(settings['operating_start'])}–"
+            f"{self._format_dashboard_time(settings['operating_end'])} IST",
+            f"🌟 Peak: {self._format_dashboard_time(settings['peak_start'])}–"
+            f"{self._format_dashboard_time(settings['peak_end'])} IST",
+            "⚙️ Limits: peak "
+            f"{settings['peak_concurrency']} · off-peak "
+            f"{settings['outside_peak_concurrency_1_20']}/"
+            f"{settings['outside_peak_concurrency_21_50']}/"
+            f"{settings['outside_peak_concurrency_51_plus']} (by account tier)",
         ]
-        if running_lines:
-            lines.append("Running: " + ", ".join(running_lines))
-        lines.append(f"\nAccount activity ({data['account_page'] + 1}/{data['account_pages']}):")
-        lines.extend(account_lines or ["No accounts are associated with an enabled campaign for this target."])
-        if not data.get("promotion_content_available"):
-            lines.append("\nUpload a sticker in the existing Sticker Library to use the scheduled promotion sequence.")
-        if data.get("restricted_pairs"):
-            lines.append("\nRestricted account-target pairs:")
-            lines.extend(f"- Account {item['account_id']} → target {item['target_id']} ({item['status']})"
-                         for item in data["restricted_pairs"][:10])
-        if data.get("suspended_campaigns"):
-            lines.append("\nNormal campaigns suspended by scheduled priority:")
-            for campaign in data["suspended_campaigns"][:8]:
-                lines.append(f"- {campaign['name']} (ID {campaign['id']}), accounts: "
-                             + (", ".join(campaign["account_ids"]) or "unavailable"))
-        if data.get("recent_activity"):
-            lines.append("\nRecent scheduler activity:")
-            for item in data["recent_activity"][:6]:
-                detail = f" — {item['reason']}" if item.get("reason") else ""
-                lines.append(f"- {item.get('occurred_at', 'unknown')}: {item.get('event_type')} "
-                             f"account {item.get('account_id', '—')}{detail}")
         buttons = []
-        if state != "Awaiting Recovery Confirmation":
-            if state == "Running":
-                buttons.append([InlineKeyboardButton("\u23F8 Pause Promotion", callback_data="promo:pause")])
-            elif state == "Paused":
-                buttons.append([InlineKeyboardButton("\u25B6 Resume Promotion", callback_data="promo:resume")])
-            else:
-                buttons.append([InlineKeyboardButton("\u25B6 Start Promotion", callback_data="promo:start")])
+        if status.get("recovery_required"):
+            buttons.append([InlineKeyboardButton("Recovery status", callback_data="dash:action:settings:scheduler_recovery")])
+        elif status.get("manually_paused"):
+            buttons.append([InlineKeyboardButton("▶️ Resume Promotion", callback_data="promo:resume")])
+        elif status.get("enabled"):
+            buttons.append([InlineKeyboardButton("⏸️ Pause Promotion", callback_data="promo:pause")])
         else:
-            buttons.append([InlineKeyboardButton("Recovery Status", callback_data="dash:action:settings:scheduler_recovery")])
-        buttons.append([InlineKeyboardButton("Configure Promotion", callback_data="promo:configure"),
-                        InlineKeyboardButton("\U0001F504 Refresh Dashboard", callback_data="promo:refresh")])
-        page_count = data["account_pages"]
+            buttons.append([InlineKeyboardButton("▶️ Start Promotion", callback_data="promo:start")])
+        buttons.extend([
+            [InlineKeyboardButton("👥 Account Activity", callback_data="promo:activity:0"),
+             InlineKeyboardButton("🚫 Restrictions", callback_data="promo:restrictions:0")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="promo:settings"),
+             InlineKeyboardButton("📊 Reports", callback_data="promo:reports")],
+            [InlineKeyboardButton("📝 Configure Promotion", callback_data="promo:configure")],
+            [InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="promo:refresh")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="dash:home"),
+             InlineKeyboardButton("🏠 Home", callback_data="dash:home")],
+        ])
+        if not data.get("promotion_content_available"):
+            lines.append("\nSticker content is not available; add a sticker before starting.")
+        await self._edit_dashboard_message(
+            query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    def _promotion_settings_keyboard(self) -> InlineKeyboardMarkup:
+        settings = asdict(self.scheduler_service.settings)
+        button_labels = {
+            "operating_start": "Operating start",
+            "operating_end": "Operating end",
+            "peak_start": "Peak start",
+            "peak_end": "Peak end",
+            "peak_concurrency": "Peak limit",
+            "outside_peak_concurrency_1_20": "Off-peak · 1–20",
+            "outside_peak_concurrency_21_50": "Off-peak · 21–50",
+            "outside_peak_concurrency_51_plus": "Off-peak · 51+",
+            "progress_report_time": "Progress report",
+            "final_report_time": "Final report",
+        }
+        rows = []
+        setting_buttons = []
+        for key in button_labels:
+            value = settings[key]
+            label_value = (
+                self._format_dashboard_time(value) if key.endswith("_start")
+                or key.endswith("_end") or key.endswith("_time") else str(value)
+            )
+            setting_buttons.append(InlineKeyboardButton(
+                f"{button_labels[key]} · {label_value}",
+                callback_data=f"promo:setting:{key}",
+            ))
+        for index in range(0, len(setting_buttons), 2):
+            rows.append(setting_buttons[index:index + 2])
+        rows.extend([
+            [InlineKeyboardButton("♻️ Restore default settings", callback_data="promo:settings:restore")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="promo:settings"),
+             InlineKeyboardButton("⬅️ Back", callback_data="promo:dashboard"),
+             InlineKeyboardButton("🏠 Home", callback_data="dash:home")],
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    async def _show_promotion_settings(self, query) -> None:
+        if self.scheduler_service is None:
+            await self._edit_dashboard_message(query, "Scheduler settings are unavailable.")
+            return
+        settings = self.scheduler_service.settings
+        text = (
+            "⚙️ Promotion Settings\n"
+            f"🕰 Operating: {self._format_dashboard_time(settings.operating_start)}–"
+            f"{self._format_dashboard_time(settings.operating_end)} IST\n"
+            f"🌟 Peak: {self._format_dashboard_time(settings.peak_start)}–"
+            f"{self._format_dashboard_time(settings.peak_end)} IST\n"
+            f"🔢 Peak account limit: {settings.peak_concurrency}\n"
+            "🔢 Off-peak limits by account tier: "
+            f"{settings.outside_peak_concurrency_1_20} / "
+            f"{settings.outside_peak_concurrency_21_50} / "
+            f"{settings.outside_peak_concurrency_51_plus}\n"
+            f"📨 Daily reports: {self._format_dashboard_time(settings.progress_report_time)} "
+            "progress · "
+            f"{self._format_dashboard_time(settings.final_report_time)} final (IST)\n\n"
+            "Select a value to update it. Telegram-imposed waits and account restrictions remain enforced."
+        )
+        await self._edit_dashboard_message(
+            query, text, reply_markup=self._promotion_settings_keyboard(),
+        )
+
+    async def _show_promotion_activity(self, query, page: int = 0, *, refresh: bool = False) -> None:
+        data = (await self.scheduler_service.refresh_promotion_dashboard_data(page)
+                if refresh else await self.scheduler_service.promotion_dashboard_data(page))
+        accounts = data.get("accounts", [])
+        page_count = max(1, data.get("account_pages", 1))
+        page = min(max(0, page), page_count - 1)
+        indicators = {
+            "Running": "🟢 Running",
+            "Waiting": "🟡 Idle / Waiting",
+            "Paused": "⏸️ Paused",
+            "Restricted": "🚫 Restricted",
+            "Rate Limited": "⏳ Rate Limited",
+            "Unavailable": "🔴 Offline",
+        }
+        lines = ["👥 Account Activity"]
+        for row in accounts:
+            lines.append(f"\n{row['account_name']} · {indicators.get(row['status'], row['status'])}")
+            lines.append(
+                f"Cycles: {row['window_completed_cycles']} this window · {row['completed_cycles']} lifetime"
+            )
+            last_activity = self._format_dashboard_datetime(row.get("last_activity"))
+            if last_activity:
+                lines.append(f"Last activity: {last_activity}")
+            reason = None
+            if row["status"] == "Rate Limited" and row.get("rate_limit_seconds") is not None:
+                reason = f"Telegram wait remaining: {self._format_duration(row['rate_limit_seconds'])}"
+            elif row["status"] == "Paused":
+                reason = "Promotion paused by owner"
+            elif row["status"] == "Waiting":
+                current_status = data.get("status", {})
+                if current_status.get("recovery_required"):
+                    reason = "Awaiting recovery confirmation"
+                elif not current_status.get("enabled"):
+                    reason = "Promotion is stopped"
+                elif current_status.get("operating_period") == "inactive":
+                    reason = "Outside operating hours"
+                else:
+                    reason = row.get("last_error")
+            elif row["status"] in {"Unavailable", "Restricted"}:
+                reason = row.get("last_error")
+            if reason:
+                lines.append(f"Reason: {reason}")
+        if not accounts:
+            lines.append("\nNo accounts are available for this promotion.")
+        rows = []
         if page_count > 1:
             nav = []
-            if page > 0:
-                nav.append(InlineKeyboardButton("Previous", callback_data=f"promo:page:{page - 1}"))
+            if page:
+                nav.append(InlineKeyboardButton("◀️ Previous", callback_data=f"promo:activity:{page - 1}"))
             nav.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data="noop"))
             if page + 1 < page_count:
-                nav.append(InlineKeyboardButton("Next", callback_data=f"promo:page:{page + 1}"))
-            buttons.append(nav)
-        text = "\n".join(lines)
-        chunks = self.reporting_service.split_text(text) if self.reporting_service is not None else [text[:3900]]
-        await query.edit_message_text(
-            chunks[0], reply_markup=self._dashboard_navigation(
-                InlineKeyboardMarkup(buttons), query.message.chat_id, back_data="dash:home",
-            ),
+                nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"promo:activity:{page + 1}"))
+            rows.append(nav)
+        rows.append([
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"promo:activity_refresh:{page}"),
+            InlineKeyboardButton("⬅️ Back", callback_data="promo:dashboard"),
+            InlineKeyboardButton("🏠 Home", callback_data="dash:home"),
+        ])
+        await self._edit_dashboard_message(
+            query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _show_promotion_restrictions(self, query, page: int = 0) -> None:
+        try:
+            records = sorted(
+                self.restriction_repository.list(),
+                key=lambda item: str(item.get("detected_at", "")),
+                reverse=True,
+            )
+        except Exception as exc:
+            logger.warning("Could not load promotion restriction records (error=%s)", type(exc).__name__)
+            await self._edit_dashboard_message(
+                query,
+                "Could not load restrictions.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Refresh", callback_data="promo:restrictions:0"),
+                    InlineKeyboardButton("⬅️ Back", callback_data="promo:dashboard"),
+                    InlineKeyboardButton("🏠 Home", callback_data="dash:home"),
+                ]]),
+            )
+            return
+        page_size = 5
+        page_count = max(1, (len(records) + page_size - 1) // page_size)
+        page = min(max(0, int(page)), page_count - 1)
+        selected = records[page * page_size:(page + 1) * page_size]
+        lines = ["🚫 Promotion Restrictions"]
+        for record in selected:
+            account_name = self._restriction_account_label(str(record.get("account_id", "")))
+            target_name = str(record.get("target_username") or "unknown").lstrip("@")
+            lines.append(f"\n{account_name} → @{target_name}")
+            reason = record.get("detection_reason")
+            if reason:
+                lines.append(f"Reason: {reason}")
+            lines.append(f"Status: {str(record.get('status') or 'active').title()}")
+            detected = self._format_dashboard_datetime(
+                record.get("detected_at") or record.get("created_at")
+            )
+            if detected:
+                lines.append(f"Detected: {detected}")
+        if not selected:
+            lines.append("\nNo promotion restrictions are recorded.")
+        rows = []
+        if page_count > 1:
+            nav = []
+            if page:
+                nav.append(InlineKeyboardButton("◀️ Previous", callback_data=f"promo:restrictions:{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{page_count}", callback_data="noop"))
+            if page + 1 < page_count:
+                nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"promo:restrictions:{page + 1}"))
+            rows.append(nav)
+        rows.append([
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"promo:restrictions:{page}"),
+            InlineKeyboardButton("⬅️ Back", callback_data="promo:dashboard"),
+            InlineKeyboardButton("🏠 Home", callback_data="dash:home"),
+        ])
+        await self._edit_dashboard_message(
+            query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _show_promotion_reports(self, query) -> None:
+        buttons = [
+            [InlineKeyboardButton("📊 Current operating window", callback_data="promo:report:current")],
+            [InlineKeyboardButton("🕘 Latest progress report", callback_data="promo:report:progress")],
+            [InlineKeyboardButton("🌙 Latest final report", callback_data="promo:report:final")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="promo:reports")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="promo:dashboard"),
+             InlineKeyboardButton("🏠 Home", callback_data="dash:home")],
+        ]
+        await self._edit_dashboard_message(
+            query, "📊 Promotion Reports\nChoose a report to view.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def _show_promotion_report(self, query, kind: str) -> None:
+        if self.reporting_service is None or self.scheduler_service is None:
+            await self._edit_dashboard_message(query, "Scheduled reporting is unavailable.")
+            return
+        if kind == "current":
+            settings = self.scheduler_service.settings
+            report = self.reporting_service.build_current_report(
+                scheduler_enabled=self.scheduler_service.enabled,
+                operating_start=settings.operating_start,
+                operating_end=settings.operating_end,
+                scheduler_status=self.scheduler_service.state.value,
+            )
+        else:
+            report = self.reporting_service.latest(kind)
+        if report is None:
+            await self._edit_dashboard_message(
+                query, "No saved report is available yet.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Back", callback_data="promo:reports"),
+                    InlineKeyboardButton("🏠 Home", callback_data="dash:home"),
+                ]]),
+            )
+            return
+        chunks = self.reporting_service.split_text(self.reporting_service.format_report(report))
+        await self._edit_dashboard_message(
+            query, chunks[0], reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data="promo:reports"),
+                InlineKeyboardButton("🏠 Home", callback_data="dash:home"),
+            ]]),
         )
         for chunk in chunks[1:]:
-            await self._application.bot.send_message(chat_id=self.settings.admin_id, text=chunk)
+            await self._application.bot.send_message(
+                chat_id=query.message.chat_id, text=chunk,
+            )
 
     async def _show_promotion_targets(self, message_or_query, page: int = 0, edit: bool = False) -> None:
         targets = self._targets(opted_in_only=True)
@@ -618,9 +842,9 @@ class ControlBotService:
                           ("Stop campaign", "stop"), ("Suspended campaigns", "suspended"),
                           ("Delete campaign", "delete")],
             "restrictions": [("View restrictions", "list")],
-            "reports": [("Latest 9 PM progress report", "progress"),
-                        ("Latest 3:15 AM final report", "final"),
-                        ("Current scheduled statistics", "current")],
+            "reports": [("Latest progress report", "progress"),
+                        ("Latest final report", "final"),
+                        ("Current promotion report", "current")],
             "settings": [("Scheduler status", "scheduler_status"), ("Enable / disable scheduler", "scheduler_toggle"),
                          ("Recovery status", "scheduler_recovery")],
         }
@@ -691,7 +915,9 @@ class ControlBotService:
             for nonce, confirmation in list(self._action_confirmations.items()):
                 if confirmation.chat_id == chat_id:
                     self._action_confirmations.pop(nonce, None)
-        if destination == "back" and chat_id in self._dashboard_sections:
+        if destination == "back" and workflow is not None and workflow.kind == "promotion_setting":
+            await self._show_promotion_settings(query)
+        elif destination == "back" and chat_id in self._dashboard_sections:
             self._discard_pending_sticker_upload(workflow)
             await self._dashboard_show_section(query, self._dashboard_sections[chat_id])
         else:
@@ -818,7 +1044,7 @@ class ControlBotService:
         except Exception as exc:
             logger.warning("Could not read account label for restriction dashboard (error=%s)", type(exc).__name__)
             account = {}
-        return str(account.get("name") or account.get("phone") or account_id[:8] or "Unavailable")
+        return str(account.get("name") or account.get("phone") or "Unnamed account")
 
     async def _show_restriction(self, query, record_id: str) -> None:
         chat_id = query.message.chat_id if query.message is not None else 0
@@ -893,8 +1119,20 @@ class ControlBotService:
                 await query.edit_message_text("Scheduled reporting service is unavailable.")
                 return
             if action == "current":
+                scheduler_settings = (
+                    self.scheduler_service.settings if self.scheduler_service is not None else None
+                )
                 report = self.reporting_service.build_current_report(
                     scheduler_enabled=bool(self.scheduler_service and self.scheduler_service.enabled),
+                    operating_start=(
+                        scheduler_settings.operating_start if scheduler_settings else "15:00"
+                    ),
+                    operating_end=(
+                        scheduler_settings.operating_end if scheduler_settings else "03:00"
+                    ),
+                    scheduler_status=(
+                        self.scheduler_service.state.value if self.scheduler_service else None
+                    ),
                 )
             else:
                 report = self.reporting_service.latest(action)
@@ -925,54 +1163,43 @@ class ControlBotService:
                 self.scheduler_service.set_enabled(not self.scheduler_service.enabled)
             status = self.scheduler_service.status()
             settings = status["settings"]
-            running_accounts = status.get("running_scheduled_accounts", [])
-            idle_accounts = status.get("idle_eligible_accounts", [])
-            scheduled_campaigns = status.get("active_scheduled_campaigns", [])
-            restricted_pairs = status.get("restricted_or_excluded_pairs", [])
-            running_text = ", ".join(running_accounts) or "none"
-            idle_text = ", ".join(idle_accounts) or "none"
-            campaign_text = ", ".join(scheduled_campaigns) or "none"
-            restricted_text = ", ".join(
-                f"{item.get('account_id')}→{item.get('target_id')} ({item.get('status')})"
-                for item in restricted_pairs[:20]
+            account_names = lambda ids: ", ".join(
+                self._restriction_account_label(str(account_id)) for account_id in ids
             ) or "none"
+            period = {
+                "peak": "Peak", "outside_peak": "Off-Peak", "inactive": "Outside Operating Hours",
+            }.get(str(status.get("operating_period")), "Outside Operating Hours")
+            next_transition = self._format_dashboard_datetime(status.get("next_transition"))
             text = (
-                f"Scheduler: {status['state']}\nEnabled: {'Yes' if status['enabled'] else 'No'}\n"
-                f"Current period: {status.get('operating_period', 'inactive')}\n"
-                f"Eligible accounts: {status.get('eligible_account_count', 0)}\n"
-                f"Maximum concurrency: {status.get('maximum_concurrency', 0)}\n"
-                f"Running scheduled accounts: {running_text}\nIdle eligible accounts: {idle_text}\n"
-                f"Active scheduled campaigns: {campaign_text}\n"
-                f"Restricted/excluded pairs ({len(restricted_pairs)}): {restricted_text}\n"
-                f"Next window transition: {status.get('next_transition', 'unavailable')}\n"
-                f"Timezone: {settings['timezone']}\n"
-                f"Operating window: {settings['operating_start']}–{settings['operating_end']}\n"
-                f"Peak window: {settings['peak_start']}–{settings['peak_end']}\n"
-                f"Concurrency: outside peak {settings['outside_peak_concurrency_1_20']}/"
+                f"Scheduler: {status['state'].replace('_', ' ').title()} · "
+                f"{'enabled' if status['enabled'] else 'disabled'}\n"
+                f"Current period: {period}\n"
+                f"Eligible accounts: {status.get('eligible_account_count', 0)} · "
+                f"maximum concurrency: {status.get('maximum_concurrency', 0)}\n"
+                f"Running: {account_names(status.get('running_scheduled_accounts', []))}\n"
+                f"Waiting: {account_names(status.get('idle_eligible_accounts', []))}\n"
+                f"Next transition: {next_transition or 'unavailable'}\n"
+                f"Operating hours: {self._format_dashboard_time(settings['operating_start'])}–"
+                f"{self._format_dashboard_time(settings['operating_end'])} IST\n"
+                f"Peak hours: {self._format_dashboard_time(settings['peak_start'])}–"
+                f"{self._format_dashboard_time(settings['peak_end'])} IST\n"
+                f"Concurrency: off-peak {settings['outside_peak_concurrency_1_20']}/"
                 f"{settings['outside_peak_concurrency_21_50']}/{settings['outside_peak_concurrency_51_plus']} "
-                f"by eligible account tier; peak max {settings['peak_concurrency']}"
+                f"by account tier · peak {settings['peak_concurrency']}"
             )
             recovery = status.get("recovery") or {}
             assignments = recovery.get("assignments") or []
             recovery_lines = [
-                "Recovery status: " + status.get("recovery_confirmation_status", "not_required"),
-                f"Recovery required: {'Yes' if status.get('recovery_required') else 'No'}",
-                f"Last known operating period: {recovery.get('last_operating_period', 'unknown')}",
-                f"Last known scheduler status: {recovery.get('last_known_scheduler_status', 'unknown')}",
-                f"Interrupted assignments: {len(assignments)}",
+                "\nRecovery status: " + status.get("recovery_confirmation_status", "not_required").replace("_", " "),
+                f"Interrupted accounts: {len(assignments)}",
             ]
             for item in assignments:
                 progress = item.get("progress") or {}
-                saved_cycles = list((progress.get("next_cycles") or {}).items())
-                cycles = ", ".join(
-                    f"{target}:{cycle}" for target, cycle in saved_cycles[:12]
-                ) or "no cycle checkpoint"
-                if len(saved_cycles) > 12:
-                    cycles += f", and {len(saved_cycles) - 12} more targets"
+                account_id = str(item.get("account_id") or "")
                 recovery_lines.append(
-                    f"- {item.get('campaign_name', item.get('campaign_id'))} (ID {item.get('campaign_id')}) / "
-                    f"{item.get('account_name', item.get('account_id'))} (ID {item.get('account_id')}): "
-                    f"{progress.get('successful', 0)} successful, {progress.get('failed', 0)} failed; {cycles}"
+                    f"• {item.get('campaign_name', 'Promotion')} · "
+                    f"{self._restriction_account_label(account_id)} · "
+                    f"{progress.get('successful', 0)} completed cycles saved"
                 )
             text += "\n" + "\n".join(recovery_lines)
             buttons = [[InlineKeyboardButton(
@@ -1276,7 +1503,8 @@ class ControlBotService:
             else:
                 text = (
                     "Recovery confirmed outside operating hours. The scheduler remains enabled and will wait "
-                    "until the next 3:00 PM IST window.\n"
+                    f"until the next "
+                    f"{self._format_dashboard_time(self.scheduler_service.settings.operating_start)} IST window.\n"
                     f"Eligible accounts: {result.get('eligible_account_count', 0)}; "
                     f"campaigns: {result.get('eligible_campaign_count', 0)}."
                 )
@@ -1291,6 +1519,69 @@ class ControlBotService:
                 return
             if len(parts) == 2 and parts[1] in {"dashboard", "refresh"}:
                 await self._show_promotion_dashboard(query, 0, refresh=parts[1] == "refresh")
+                return
+            if parts == ["promo", "settings"]:
+                await self._show_promotion_settings(query)
+                return
+            if parts == ["promo", "settings", "restore"]:
+                if query.message.chat.type != "private":
+                    await self._edit_dashboard_message(
+                        query, "Promotion settings can only be changed in a private chat.",
+                    )
+                    return
+                try:
+                    self.scheduler_service.restore_default_settings()
+                except JsonStoreError as exc:
+                    logger.error("Could not restore scheduler settings (error=%s)", type(exc).__name__)
+                    await self._edit_dashboard_message(
+                        query, "Default settings could not be saved. Existing settings remain active.",
+                    )
+                    return
+                await self._show_promotion_settings(query)
+                return
+            if len(parts) == 3 and parts[1] == "activity" and parts[2].isdigit():
+                await self._show_promotion_activity(query, int(parts[2]))
+                return
+            if len(parts) == 3 and parts[1] == "activity_refresh" and parts[2].isdigit():
+                await self._show_promotion_activity(query, int(parts[2]), refresh=True)
+                return
+            if len(parts) == 3 and parts[1] == "restrictions" and parts[2].isdigit():
+                await self._show_promotion_restrictions(query, int(parts[2]))
+                return
+            if parts == ["promo", "reports"]:
+                await self._show_promotion_reports(query)
+                return
+            if len(parts) == 3 and parts[1] == "report" and parts[2] in {
+                "current", "progress", "final",
+            }:
+                await self._show_promotion_report(query, parts[2])
+                return
+            if len(parts) == 3 and parts[1] == "setting":
+                setting_fields = set(asdict(self.scheduler_service.settings)) - {"timezone"}
+                setting_name = parts[2]
+                if setting_name not in setting_fields:
+                    await self._edit_dashboard_message(query, "This setting is unavailable.")
+                    return
+                if query.message.chat.type != "private":
+                    await self._edit_dashboard_message(
+                        query, "Promotion settings can only be changed in a private chat.",
+                    )
+                    return
+                key = (self.settings.admin_id, query.message.chat_id)
+                if not self._begin_workflow(
+                    key, "promotion_setting", "value", {"setting": setting_name},
+                ):
+                    await self._edit_dashboard_message(
+                        query, "Finish or cancel the active dashboard workflow first.",
+                    )
+                    return
+                if setting_name.endswith("_time") or setting_name.endswith("_start") or setting_name.endswith("_end"):
+                    prompt = "Send the time as 9:00 PM (or 21:00)."
+                else:
+                    prompt = "Send the whole-number account limit."
+                await self._edit_dashboard_message(
+                    query, prompt, reply_markup=self._flow_navigation(query.message.chat_id),
+                )
                 return
             if len(parts) == 3 and parts[1] == "page" and parts[2].isdigit():
                 await self._show_promotion_dashboard(query, int(parts[2]))
@@ -2132,6 +2423,55 @@ class ControlBotService:
             return
         workflow.expires_at = datetime.now(timezone.utc) + _FLOW_TIMEOUT
         text = message.text.strip()
+        if workflow.kind == "promotion_setting" and workflow.step == "value":
+            setting_name = str(workflow.data.get("setting", ""))
+            setting_fields = set(asdict(self.scheduler_service.settings)) - {"timezone"} \
+                if self.scheduler_service is not None else set()
+            if self.scheduler_service is None or setting_name not in setting_fields:
+                self._workflows.pop(key, None)
+                await message.reply_text("This promotion setting is no longer available.")
+                return
+            try:
+                if setting_name.endswith("_time") or setting_name.endswith("_start") or setting_name.endswith("_end"):
+                    parsed_time = None
+                    for time_format in ("%I:%M %p", "%H:%M"):
+                        try:
+                            parsed_time = datetime.strptime(text.upper(), time_format).time()
+                            break
+                        except ValueError:
+                            continue
+                    if parsed_time is None:
+                        raise ValueError("Enter a valid time such as 9:00 PM or 21:00.")
+                    value = parsed_time.strftime("%H:%M")
+                else:
+                    try:
+                        value = int(text)
+                    except ValueError as exc:
+                        raise ValueError("Enter a whole number within the allowed limit.") from exc
+                self.scheduler_service.update_settings(**{setting_name: value})
+            except ValueError as exc:
+                await message.reply_text(
+                    f"{exc}\nTry again or use /cancel.",
+                    reply_markup=self._flow_navigation(message.chat_id),
+                )
+                return
+            except JsonStoreError as exc:
+                logger.error("Could not persist scheduler setting (error=%s)", type(exc).__name__)
+                await message.reply_text(
+                    "The setting could not be saved. Existing settings remain active; try again or /cancel.",
+                    reply_markup=self._flow_navigation(message.chat_id),
+                )
+                return
+            self._workflows.pop(key, None)
+            await message.reply_text(
+                "Promotion setting saved.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Back", callback_data="promo:dashboard"),
+                    InlineKeyboardButton("⚙️ Settings", callback_data="promo:settings"),
+                    InlineKeyboardButton("🏠 Home", callback_data="dash:home"),
+                ]]),
+            )
+            return
         if workflow.kind == "promotion_config" and workflow.step == "name":
             if not text or len(text) > 80:
                 await message.reply_text("Enter a promotion name between 1 and 80 characters, or cancel.",
