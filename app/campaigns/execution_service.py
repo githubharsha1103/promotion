@@ -1232,10 +1232,10 @@ class CampaignExecutionService:
     def _task_for(self, campaign_id: str, account_id: str, target_id: str) -> dict | None:
         return self._task_store(campaign_id).get(self._task_id(campaign_id, account_id, target_id))
 
-    async def _storage_io(self, operation, *args, **kwargs):
+    async def _storage_io(self, func, *args, **kwargs):
         """Bound synchronous JSON lock/read/write work away from the event loop."""
         async with self._storage_io_slots:
-            return await asyncio.to_thread(operation, *args, **kwargs)
+            return await asyncio.to_thread(func, *args, **kwargs)
 
     async def _get_async(self, campaign_id: str) -> dict | None:
         return await self._storage_io(self.get, campaign_id)
