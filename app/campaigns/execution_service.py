@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
 import time
@@ -67,12 +68,25 @@ class _TargetAccessDenied(Exception):
     """Stop only the account-target task after an explicit denial response."""
 
 
+class _TargetOptedOut(Exception):
+    """Stop sending immediately when the destination withdraws consent."""
+
+
 class _RestrictionCheckUnavailable(Exception):
     """Fail closed when persistent restriction state cannot be read."""
 
 
 class _VerificationPaused(Exception):
     """Pause only the affected account-target pair for an ordinary emoji task."""
+
+
+@asynccontextmanager
+async def _execution_lock(lock: asyncio.Lock, acquire: bool):
+    if acquire:
+        async with lock:
+            yield
+    else:
+        yield
 
 
 class CampaignExecutionService:
@@ -108,12 +122,16 @@ class CampaignExecutionService:
         self._ban_events: dict[tuple[str, str], asyncio.Event] = {}
         self._restriction_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._scheduled_runtimes: dict[str, _Runtime] = {}
+        self._pending_scheduled_stops: dict[str, _Runtime] = {}
+        self._scheduled_stop_persist_task: asyncio.Task | None = None
         self._scheduled_claims: set[str] = set()
         self._normal_account_workers: dict[str, dict[asyncio.Task, tuple[str, _Runtime]]] = {}
         self._runtimes: dict[str, _Runtime] = {}
         self._account_locks: dict[str, asyncio.Lock] = {}
         self._rotation_locks: dict[str, asyncio.Lock] = {}
         self._guard = asyncio.Lock()
+        self._storage_io_slots = asyncio.Semaphore(4)
+        self._campaign_state_lock = asyncio.Lock()
         self._scheduled_event_recorder = None
         self._scheduled_promotion_repository = None
         self._scheduled_task_store = JsonStore(campaign_repository.records_dir / "scheduled_promotion_tasks.json")
@@ -196,11 +214,13 @@ class CampaignExecutionService:
         if self._is_standalone_scheduled(campaign_id):
             campaign = self.scheduled_promotion_model()
             if (campaign is None or key not in {str(value) for value in campaign.get("account_ids", [])}
-                    or not campaign.get("target_ids") or not campaign.get("sticker_id")):
+                    or not campaign.get("target_ids")):
                 return None
-            target = self.targets.get(str(campaign["target_ids"][0])) or {}
-            if target.get("opted_in") is not True or not target.get("username"):
-                return None
+            for target_id in campaign["target_ids"]:
+                target = self.targets.get(str(target_id)) or {}
+                if (target.get("opted_in") is not True or not target.get("username")
+                        or self._target_content_config(campaign, str(target_id)) is None):
+                    return None
         else:
             campaign = self._validated_campaign(str(campaign_id))
         if campaign is None:
@@ -211,7 +231,6 @@ class CampaignExecutionService:
                                                    if str(value) in selected]}
             if not campaign["target_ids"]:
                 return None
-        self._ensure_tasks(campaign)
         runtime = _Runtime()
         runtime.scheduled_campaign_id = str(campaign_id)
         runtime.scheduled_target_ids = [str(value) for value in campaign["target_ids"]]
@@ -226,12 +245,17 @@ class CampaignExecutionService:
     async def _run_scheduled_assignment(self, campaign: dict, account_id: str, runtime: _Runtime) -> None:
         campaign_id = str(campaign["id"])
         assignment_id = str(runtime.assignment_id)
-        self._record_scheduled_event(
-            "assignment_started", identity=f"assignment-start:{assignment_id}",
-            assignment_id=assignment_id, account_id=account_id, campaign_id=campaign_id,
-            tasks=self._scheduled_task_snapshot(campaign_id, account_id, runtime.scheduled_target_ids),
-        )
         try:
+            await self._ensure_tasks_async(campaign)
+            tasks = await self._storage_io(
+                self._scheduled_task_snapshot, campaign_id, account_id,
+                runtime.scheduled_target_ids,
+            )
+            self._record_scheduled_event(
+                "assignment_started", identity=f"assignment-start:{assignment_id}",
+                assignment_id=assignment_id, account_id=account_id, campaign_id=campaign_id,
+                tasks=tasks,
+            )
             await self._run_account(campaign, account_id, runtime)
         except Exception as exc:
             self._record_scheduled_event(
@@ -241,19 +265,29 @@ class CampaignExecutionService:
             )
             raise
         finally:
-            snapshot = self._scheduled_task_snapshot(campaign_id, account_id, runtime.scheduled_target_ids)
-            unfinished = any(
-                task.get("status") in {"pending", "in_progress", "suspended"}
-                and int(task.get("next_cycle", 1)) <= int(campaign.get("total_cycles", 1))
-                for task in snapshot
-            )
-            self._record_scheduled_event(
-                "assignment_finished", identity=f"assignment-finish:{assignment_id}",
-                assignment_id=assignment_id, account_id=account_id, campaign_id=campaign_id,
-                interrupted=bool(runtime.stop.is_set() and unfinished), tasks=snapshot,
-            )
-            if self._scheduled_runtimes.get(account_id) is runtime:
-                self._scheduled_runtimes.pop(account_id, None)
+            try:
+                snapshot = await self._storage_io(
+                    self._scheduled_task_snapshot, campaign_id, account_id,
+                    runtime.scheduled_target_ids,
+                )
+                unfinished = any(
+                    task.get("status") in {"pending", "in_progress", "suspended"}
+                    and int(task.get("next_cycle", 1)) <= int(campaign.get("total_cycles", 1))
+                    for task in snapshot
+                )
+                self._record_scheduled_event(
+                    "assignment_finished", identity=f"assignment-finish:{assignment_id}",
+                    assignment_id=assignment_id, account_id=account_id, campaign_id=campaign_id,
+                    interrupted=bool(runtime.stop.is_set() and unfinished), tasks=snapshot,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not snapshot scheduled assignment completion (error=%s)",
+                    type(exc).__name__,
+                )
+            finally:
+                if self._scheduled_runtimes.get(account_id) is runtime:
+                    self._scheduled_runtimes.pop(account_id, None)
 
     def _scheduled_task_snapshot(self, campaign_id: str, account_id: str,
                                  target_ids: list[str] | None = None) -> list[dict]:
@@ -263,22 +297,52 @@ class CampaignExecutionService:
 
     def stop_scheduled_assignments(self) -> None:
         """Stop workers at their next existing cycle boundary."""
-        for account_id, runtime in self._scheduled_runtimes.items():
-            campaign_id = str(runtime.scheduled_campaign_id or "")
-            campaign = self.get(campaign_id) or {}
-            snapshot = self._scheduled_task_snapshot(campaign_id, account_id, runtime.scheduled_target_ids)
-            unfinished = any(
-                int(task.get("next_cycle", 1)) <= int(campaign.get("total_cycles", 1))
-                and task.get("status") != "restricted"
-                for task in snapshot
-            )
-            self._record_scheduled_event(
-                "assignment_stop_requested",
-                identity=f"assignment-stop:{runtime.assignment_id}",
-                assignment_id=runtime.assignment_id, campaign_id=campaign_id,
-                account_id=str(account_id), unfinished=unfinished, tasks=snapshot,
-            )
+        for account_id, runtime in tuple(self._scheduled_runtimes.items()):
             runtime.stop.set()
+            self._pending_scheduled_stops[account_id] = runtime
+        if self._pending_scheduled_stops and (
+            self._scheduled_stop_persist_task is None
+            or self._scheduled_stop_persist_task.done()
+        ):
+            self._scheduled_stop_persist_task = asyncio.create_task(
+                self._persist_scheduled_stop_requests(),
+                name="scheduled-stop-persistence",
+            )
+
+    async def _persist_scheduled_stop_requests(self) -> None:
+        while self._pending_scheduled_stops:
+            pending = list(self._pending_scheduled_stops.items())
+            self._pending_scheduled_stops.clear()
+            for account_id, runtime in pending:
+                campaign_id = str(runtime.scheduled_campaign_id or "")
+                try:
+                    campaign = await self._storage_io(self.get, campaign_id) or {}
+                    snapshot = await self._storage_io(
+                        self._scheduled_task_snapshot, campaign_id, account_id,
+                        runtime.scheduled_target_ids,
+                    )
+                    unfinished = any(
+                        int(task.get("next_cycle", 1)) <= int(campaign.get("total_cycles", 1))
+                        and task.get("status") != "restricted"
+                        for task in snapshot
+                    )
+                    await self._storage_io(
+                        self._record_scheduled_event,
+                        "assignment_stop_requested",
+                        identity=f"assignment-stop:{runtime.assignment_id}",
+                        assignment_id=runtime.assignment_id,
+                        campaign_id=campaign_id,
+                        account_id=str(account_id),
+                        unfinished=unfinished,
+                        tasks=snapshot,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Could not persist scheduled stop request (error=%s)",
+                        type(exc).__name__,
+                    )
 
     def scheduled_assignment_active(self, account_id: str) -> bool:
         runtime = self._scheduled_runtimes.get(str(account_id))
@@ -343,7 +407,7 @@ class CampaignExecutionService:
     async def resume_suspended_account(self, campaign_id: str, account_id: str, callback=None) -> bool:
         """Manually resume one owner-selected suspended account worker."""
         campaign_id, account_id = str(campaign_id), str(account_id)
-        campaign = self._validated_campaign(campaign_id)
+        campaign = await self._storage_io(self._validated_campaign, campaign_id)
         if campaign is None or campaign.get("status") not in {"suspended", "paused", "failed"}:
             return False
         lock = self.account_execution_lock(account_id)
@@ -398,7 +462,9 @@ class CampaignExecutionService:
                         self._task_store(campaign_id).update(task["id"], {"status": "pending", "phase": "idle"})
             runtime = _Runtime(callback=callback)
             self._runtimes[campaign_id] = runtime
-            self._refresh_progress(campaign_id, status="running", operation="manually resumed")
+            await self._refresh_progress_async(
+                campaign_id, status="running", operation="manually resumed",
+            )
             runtime.task = asyncio.create_task(
                 self._run(campaign_id, runtime, account_ids=[account_id]),
                 name=f"campaign-{campaign_id}-resume-{account_id}",
@@ -503,10 +569,12 @@ class CampaignExecutionService:
                             logger.warning("Campaign restart cleanup failed (error=%s)", type(exc).__name__)
                     self._finish_task(task, success=False, error="interrupted_operation_not_replayed")
             if campaign_running:
-                self._refresh_progress(campaign_id, status="paused", operation="paused after restart")
+                await self._refresh_progress_async(
+                    campaign_id, status="paused", operation="paused after restart",
+                )
     async def start(self, campaign_id: str, callback=None) -> bool:
         async with self._guard:
-            campaign = self._validated_campaign(campaign_id)
+            campaign = await self._storage_io(self._validated_campaign, campaign_id)
             if campaign is None or campaign.get("status") in {"running", "completed", "suspended"}:
                 return False
             runtime = self._runtimes.get(campaign_id)
@@ -514,8 +582,10 @@ class CampaignExecutionService:
                 return False
             runtime = _Runtime(callback=callback)
             self._runtimes[campaign_id] = runtime
-            self._ensure_tasks(campaign)
-            self._refresh_progress(campaign_id, status="running", operation="starting")
+            await self._storage_io(self._ensure_tasks, campaign)
+            await self._refresh_progress_async(
+                campaign_id, status="running", operation="starting",
+            )
             runtime.task = asyncio.create_task(self._run(campaign_id, runtime), name=f"campaign-{campaign_id}")
             return True
 
@@ -525,7 +595,7 @@ class CampaignExecutionService:
         if runtime is None or runtime.task is None or campaign is None or campaign.get("status") != "running":
             return False
         runtime.pause.set()
-        self._update_campaign(campaign_id, {"pause_requested": True})
+        await self._storage_io(self._update_campaign, campaign_id, {"pause_requested": True})
         return True
 
     async def resume(self, campaign_id: str, callback=None) -> bool:
@@ -540,11 +610,13 @@ class CampaignExecutionService:
         if campaign is None or campaign.get("status") not in {"running", "paused"}:
             return False
         if runtime is None or runtime.task is None:
-            self._refresh_progress(campaign_id, status="stopped", operation="stopped")
+            await self._refresh_progress_async(
+                campaign_id, status="stopped", operation="stopped",
+            )
             return True
         runtime.stop.set()
         runtime.pause.clear()
-        self._update_campaign(campaign_id, {"stop_requested": True})
+        await self._storage_io(self._update_campaign, campaign_id, {"stop_requested": True})
         return True
 
     async def shutdown(self) -> None:
@@ -558,7 +630,7 @@ class CampaignExecutionService:
     async def _run(self, campaign_id: str, runtime: _Runtime, account_ids: list[str] | None = None) -> None:
         ticker: asyncio.Task | None = None
         try:
-            campaign = self._validated_campaign(campaign_id)
+            campaign = await self._storage_io(self._validated_campaign, campaign_id)
             if campaign is None:
                 raise RuntimeError("Campaign selections are no longer valid")
             ticker = asyncio.create_task(
@@ -566,41 +638,67 @@ class CampaignExecutionService:
                 name=f"campaign-progress-{campaign_id}",
             )
             account_ids = [str(item) for item in (account_ids or campaign["account_ids"])]
-            results = await asyncio.gather(*(
-                self._run_normal_account(campaign, account_id, runtime)
-                for account_id in account_ids
-            ), return_exceptions=True)
-            for account_id, result in zip(account_ids, results):
-                if isinstance(result, Exception):
-                    logger.warning("Campaign account worker failed independently (error=%s)", type(result).__name__)
-                    self._fail_account_remaining(campaign, account_id, type(result).__name__)
-            latest = self.get(campaign_id) or {}
+            if campaign.get("execution_mode", "sequential") == "sequential":
+                for target_id in campaign["target_ids"]:
+                    if runtime.stop.is_set() or runtime.pause.is_set():
+                        break
+                    results = await asyncio.gather(*(
+                        self._run_normal_account(
+                            campaign, account_id, runtime, [str(target_id)],
+                        )
+                        for account_id in account_ids
+                    ), return_exceptions=True)
+                    for account_id, result in zip(account_ids, results):
+                        if isinstance(result, Exception):
+                            logger.warning(
+                                "Campaign account worker failed independently (error=%s)",
+                                type(result).__name__,
+                            )
+                            self._fail_account_remaining(campaign, account_id, type(result).__name__)
+            else:
+                results = await asyncio.gather(*(
+                    self._run_normal_account(campaign, account_id, runtime)
+                    for account_id in account_ids
+                ), return_exceptions=True)
+                for account_id, result in zip(account_ids, results):
+                    if isinstance(result, Exception):
+                        logger.warning("Campaign account worker failed independently (error=%s)", type(result).__name__)
+                        self._fail_account_remaining(campaign, account_id, type(result).__name__)
+            latest = await self._get_async(campaign_id) or {}
             if runtime.stop.is_set():
                 status, operation = "stopped", "stopped"
             elif runtime.pause.is_set():
                 status, operation = "paused", "paused"
             elif runtime.failed_suspensions:
                 status, operation = "paused", "suspension could not reach a safe checkpoint"
-            elif runtime.suspended_accounts or (self.get(campaign_id) or {}).get("suspended_accounts"):
+            elif runtime.suspended_accounts or (latest.get("suspended_accounts") or []):
                 status, operation = "suspended", "suspended for scheduled priority"
             else:
                 status, operation = "completed", "complete"
-            self._refresh_progress(campaign_id, status=status, operation=operation)
-            await self._notify(runtime, self.get(campaign_id))
+            await self._refresh_progress_async(campaign_id, status=status, operation=operation)
+            await self._notify(runtime, await self._get_async(campaign_id))
         except asyncio.CancelledError:
-            self._refresh_progress(campaign_id, status="paused", operation="interrupted")
+            await self._refresh_progress_async(
+                campaign_id, status="paused", operation="interrupted",
+            )
             raise
         except Exception as exc:
             logger.warning("Campaign coordinator failed (campaign_id=%s, error=%s)", campaign_id, type(exc).__name__)
-            self._refresh_progress(campaign_id, status="failed", operation="failed", last_error=type(exc).__name__)
-            await self._notify(runtime, self.get(campaign_id))
+            await self._refresh_progress_async(
+                campaign_id, status="failed", operation="failed",
+                last_error=type(exc).__name__,
+            )
+            await self._notify(runtime, await self._get_async(campaign_id))
         finally:
             if ticker is not None:
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
             self._runtimes.pop(campaign_id, None)
 
-    async def _run_normal_account(self, campaign: dict, account_id: str, runtime: _Runtime) -> None:
+    async def _run_normal_account(
+        self, campaign: dict, account_id: str, runtime: _Runtime,
+        target_ids: list[str] | None = None,
+    ) -> None:
         task = asyncio.current_task()
         workers = self._normal_account_workers.setdefault(str(account_id), {})
         if task is not None:
@@ -608,7 +706,9 @@ class CampaignExecutionService:
         if self.scheduled_account_claimed(account_id):
             runtime.suspend_accounts.add(str(account_id))
         try:
-            await self._run_account(campaign, str(account_id), runtime)
+            await self._run_account(
+                campaign, str(account_id), runtime, selected_target_ids=target_ids,
+            )
         finally:
             if task is not None:
                 workers.pop(task, None)
@@ -658,20 +758,58 @@ class CampaignExecutionService:
         })
         return True
 
-    async def _run_account(self, campaign: dict, account_id: str, runtime: _Runtime) -> None:
+    async def _run_account(
+        self, campaign: dict, account_id: str, runtime: _Runtime,
+        selected_target_ids: list[str] | None = None, lock_held: bool = False,
+    ) -> None:
         account_lock = self.account_execution_lock(account_id)
-        async with account_lock:
+        async with _execution_lock(account_lock, not lock_held):
+            target_ids = (
+                [str(value) for value in selected_target_ids]
+                if selected_target_ids is not None
+                else [str(value) for value in campaign["target_ids"]]
+            )
+            if (
+                not lock_held
+                and campaign.get("execution_mode") == "parallel"
+                and len(target_ids) > 1
+            ):
+                try:
+                    concurrency_limit = int(campaign.get("concurrency_limit", 3))
+                except (TypeError, ValueError):
+                    concurrency_limit = 1
+                if self._scheduled_promotion_repository is not None:
+                    configured = self._scheduled_promotion_repository.get_config().get(
+                        "parallel_target_concurrency", 3,
+                    )
+                    try:
+                        concurrency_limit = min(concurrency_limit, int(configured))
+                    except (TypeError, ValueError):
+                        concurrency_limit = 1
+                concurrency_limit = max(1, min(5, concurrency_limit))
+                semaphore = asyncio.Semaphore(concurrency_limit)
+
+                async def run_target(target_id: str) -> None:
+                    async with semaphore:
+                        await self._run_account(
+                            campaign, account_id, runtime, [target_id], lock_held=True,
+                        )
+
+                await asyncio.gather(*(run_target(target_id) for target_id in target_ids))
+                return
             if self._normal_suspension_requested(runtime, account_id):
                 self._suspend_normal_account(campaign, account_id, runtime)
                 return
             eligible_targets: list[tuple[str, dict]] = []
-            for target_id in campaign["target_ids"]:
+            for target_id in target_ids:
                 if self._normal_suspension_requested(runtime, account_id):
                     self._suspend_normal_account(campaign, account_id, runtime)
                     return
-                task = self._task_for(campaign["id"], account_id, target_id)
+                task = await self._task_for_async(campaign["id"], account_id, target_id)
                 if task is None:
-                    task = self._set_task(campaign, account_id, target_id, {"phase": "idle"})
+                    task = await self._set_task_async(
+                        campaign, account_id, target_id, {"phase": "idle"},
+                    )
                 if task.get("status") == "restricted":
                     continue
                 target = self.targets.get(target_id)
@@ -679,12 +817,14 @@ class CampaignExecutionService:
                     self._fail_target_remaining(campaign, account_id, target_id, "target_not_opted_in")
                     continue
                 try:
-                    restriction = self._restriction_for(account_id, target_id, target)
+                    restriction = await self._restriction_for_async(
+                        account_id, target_id, target,
+                    )
                 except Exception as exc:
                     logger.warning("Could not check account-target restriction (error=%s)", type(exc).__name__)
                     self._fail_target_remaining(campaign, account_id, target_id, "restriction_store_unavailable")
                     # An unavailable restriction store makes eligibility unknown.
-                    for remaining_id in campaign["target_ids"]:
+                    for remaining_id in target_ids:
                         if remaining_id != target_id:
                             self._fail_target_remaining(campaign, account_id, remaining_id, "restriction_store_unavailable")
                     return
@@ -721,12 +861,13 @@ class CampaignExecutionService:
             for target_id, target in eligible_targets:
                 if runtime.stop.is_set() or runtime.pause.is_set():
                     return
-                task = self._task_for(campaign["id"], account_id, target_id)
+                task = await self._task_for_async(campaign["id"], account_id, target_id)
                 if task is None or task.get("status") == "restricted":
                     continue
-                task = self._task_for(campaign["id"], account_id, target_id)
                 try:
-                    restriction = self._restriction_for(account_id, target_id, target)
+                    restriction = await self._restriction_for_async(
+                        account_id, target_id, target,
+                    )
                 except Exception:
                     self._fail_target_remaining(campaign, account_id, target_id, "restriction_store_unavailable")
                     continue
@@ -748,12 +889,14 @@ class CampaignExecutionService:
                 bot_id = int(getattr(entity, "id"))
                 if target.get("telegram_user_id") != bot_id:
                     target = self.targets.update(target_id, {"telegram_user_id": bot_id})
-                restriction = self._restriction_for(account_id, target_id, target, target_bot_id=bot_id)
+                restriction = await self._restriction_for_async(
+                    account_id, target_id, target, target_bot_id=bot_id,
+                )
                 if restriction is not None:
                     self._mark_target_restricted(campaign, account_id, target_id, restriction)
                     continue
 
-                recovery_task = self._task_for(campaign["id"], account_id, target_id)
+                recovery_task = await self._task_for_async(campaign["id"], account_id, target_id)
                 if recovery_task is not None and recovery_task.get("status") == "verification_paused":
                     self.ban_detection.watch_target(
                         account_id, target_id, str(target["username"]), client, entity,
@@ -767,7 +910,9 @@ class CampaignExecutionService:
                         )
                     finally:
                         self.ban_detection.stop_watching_target(client, entity)
-                    recovery_task = self._task_for(campaign["id"], account_id, target_id) or recovery_task
+                    recovery_task = (
+                        await self._task_for_async(campaign["id"], account_id, target_id)
+                    ) or recovery_task
                     if recovery_task.get("status") in {"verification_paused", "verification_failed"}:
                         continue
 
@@ -777,7 +922,9 @@ class CampaignExecutionService:
                         return
                     if runtime.stop.is_set() or runtime.pause.is_set():
                         return
-                    task = self._task_for(campaign["id"], account_id, target_id) or task
+                    task = (await self._task_for_async(
+                        campaign["id"], account_id, target_id,
+                    )) or task
                     if task.get("status") in {"restricted", "verification_paused", "verification_failed"}:
                         break
                     detected = self.ban_detection.result_for(account_id, target_id)
@@ -787,14 +934,16 @@ class CampaignExecutionService:
                     # Record which cycle is being prepared before reconnecting.
                     # If that reconnect fails, the failure is attributed to this
                     # cycle instead of the previous completed one.
-                    self._set_task(campaign, account_id, target_id, {
+                    await self._set_task_async(campaign, account_id, target_id, {
                         "phase": "preparing", "current_cycle": cycle,
                         "search_started": False,
                     })
                     if not await self.client_manager.is_connected(account_id):
                         try:
                             if not await self.client_manager.connect(account_id):
-                                self._finish_task(task, success=False, error="account_disconnected")
+                                await self._finish_task_async(
+                                    task, success=False, error="account_disconnected",
+                                )
                                 continue
                             client = self.client_manager.get_client(account_id)
                             entity = await client.get_entity(target["username"])
@@ -805,9 +954,13 @@ class CampaignExecutionService:
                             if target.get("telegram_user_id") != bot_id:
                                 target = self.targets.update(target_id, {"telegram_user_id": bot_id})
                         except Exception as exc:
-                            self._finish_task(task, success=False, error=type(exc).__name__)
+                            await self._finish_task_async(
+                                task, success=False, error=type(exc).__name__,
+                            )
                             continue
-                    restriction = self._restriction_for(account_id, target_id, target, target_bot_id=bot_id)
+                    restriction = await self._restriction_for_async(
+                        account_id, target_id, target, target_bot_id=bot_id,
+                    )
                     if restriction is not None:
                         self._mark_target_restricted(campaign, account_id, target_id, restriction)
                         break
@@ -829,102 +982,137 @@ class CampaignExecutionService:
         campaign_id = campaign["id"]
         account_id = task["account_id"]
         target_id = task["target_id"]
+        content = await self._target_content_config_async(campaign, str(target_id))
+        if content is None:
+            self._fail_target_remaining(campaign, account_id, target_id, "campaign_content_unavailable")
+            return False
         ban_event = self._ban_events.setdefault((str(account_id), str(target_id)), asyncio.Event())
         verification_event = self._verification_events.setdefault(
             (str(campaign_id), str(account_id), str(target_id)), asyncio.Event()
         )
-        username = str((self.targets.get(target_id) or {}).get("username", "unknown"))
-        self._set_current(campaign_id, account_id, target_id, cycle, "searching")
-        current_task = self._task_for(campaign_id, account_id, target_id) or task
+        target = await self._storage_io(self.targets.get, str(target_id)) or {}
+        username = str(target.get("username", "unknown"))
+        await self._set_current_async(campaign_id, account_id, target_id, cycle, "searching")
+        current_task = await self._task_for_async(campaign_id, account_id, target_id) or task
         resume_phase = str(current_task.get("verification_resume_phase") or "search")
         try:
-            self._raise_if_banned(account_id, target_id)
+            await self._raise_if_target_opted_out_async(target_id)
+            await self._raise_if_banned_async(account_id, target_id)
             self._raise_if_verification_paused(account_id, target_id, campaign_id)
 
             if resume_phase in {"search", "opening", "idle"}:
-                self._set_task(campaign, account_id, target_id, {
+                await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "opening", "current_cycle": cycle, "search_started": False,
                     "verification_resume_phase": "search",
                 })
-                self._set_task(campaign, account_id, target_id, {
+                await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "search_pending", "search_started": True,
                 })
+                await self._raise_if_target_opted_out_async(target_id)
                 await client.send_message(entity, "/search")
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "search")
-                self._raise_if_banned(account_id, target_id)
+                await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
-                self._set_task(campaign, account_id, target_id, {
+                await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "after_search", "search_started": True,
-                    "verification_resume_phase": "sticker",
+                    "verification_resume_phase": (
+                        "sticker" if content["sticker_enabled"] else
+                        "message" if content["text_enabled"] else "stop"
+                    ),
                 })
-                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._set_current_async(campaign_id, account_id, target_id, cycle, "waiting")
                 await self._wait_for_cycle(
                     self.timing.AFTER_SEARCH_SECONDS, ban_event, verification_event,
                     account_id, target_id, campaign_id,
                 )
 
-            if resume_phase in {"search", "opening", "idle", "sticker"}:
-                sticker_path = self._sticker_path(campaign["sticker_id"])
-                self._set_current(campaign_id, account_id, target_id, cycle, "sending sticker")
-                self._set_task(campaign, account_id, target_id, {"phase": "sticker_pending", "search_started": True})
-                sticker = self.stickers.get(campaign["sticker_id"]) or {}
+            if content["sticker_enabled"] and resume_phase in {"search", "opening", "idle", "sticker"}:
+                sticker_path = self._sticker_path(str(content["sticker_id"]))
+                await self._set_current_async(
+                    campaign_id, account_id, target_id, cycle, "sending sticker",
+                )
+                await self._set_task_async(
+                    campaign, account_id, target_id,
+                    {"phase": "sticker_pending", "search_started": True},
+                )
+                sticker = await self._storage_io(
+                    self.stickers.get, str(content["sticker_id"]),
+                ) or {}
+                await self._raise_if_target_opted_out_async(target_id)
                 await client.send_file(
                     entity, str(sticker_path),
                     attributes=self._sticker_attributes(sticker, sticker_path),
                 )
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "sticker")
-                self._raise_if_banned(account_id, target_id)
+                await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
-                self._set_task(campaign, account_id, target_id, {
+                await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "after_sticker", "search_started": True,
-                    "verification_resume_phase": "message",
+                    "verification_resume_phase": "message" if content["text_enabled"] else "stop",
                 })
-                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._set_current_async(campaign_id, account_id, target_id, cycle, "waiting")
                 await self._wait_for_cycle(
                     self.timing.AFTER_STICKER_SECONDS, ban_event, verification_event,
                     account_id, target_id, campaign_id,
                 )
 
-            if resume_phase in {"search", "opening", "idle", "sticker", "message"}:
-                rotation_index, promotion_text = await self._reserve_rotation(campaign_id)
-                self._set_task(campaign, account_id, target_id, {
+            if content["text_enabled"] and resume_phase in {"search", "opening", "idle", "sticker", "message"}:
+                if content.get("legacy_rotating_text") is True:
+                    rotation_index, promotion_text = await self._reserve_rotation(campaign_id)
+                else:
+                    rotation_index = None
+                    promotion_text = str(content["promotional_text"])
+                await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "message_pending", "rotation_index": rotation_index,
                     "search_started": True,
                 })
-                self._set_current(campaign_id, account_id, target_id, cycle, "sending message")
+                await self._set_current_async(
+                    campaign_id, account_id, target_id, cycle, "sending message",
+                )
+                await self._raise_if_target_opted_out_async(target_id)
                 await client.send_message(entity, promotion_text)
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "promotion_message")
-                self._raise_if_banned(account_id, target_id)
+                await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
-                self._set_task(campaign, account_id, target_id, {
+                await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "after_message", "search_started": True,
                     "verification_resume_phase": "stop",
                 })
-                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._set_current_async(campaign_id, account_id, target_id, cycle, "waiting")
                 await self._wait_for_cycle(
                     self.timing.AFTER_TEXT_SECONDS, ban_event, verification_event,
                     account_id, target_id, campaign_id,
                 )
 
             if resume_phase in {"search", "opening", "idle", "sticker", "message", "stop"}:
-                self._set_current(campaign_id, account_id, target_id, cycle, "stopping")
-                self._set_task(campaign, account_id, target_id, {"phase": "stop_pending", "search_started": True})
+                await self._set_current_async(
+                    campaign_id, account_id, target_id, cycle, "stopping",
+                )
+                await self._set_task_async(
+                    campaign, account_id, target_id,
+                    {"phase": "stop_pending", "search_started": True},
+                )
+                await self._raise_if_target_opted_out_async(target_id)
                 await client.send_message(entity, "/stop")
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "stop")
-                self._raise_if_banned(account_id, target_id)
+                await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
-                self._set_task(campaign, account_id, target_id, {
+                await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "after_stop", "search_started": False,
                     "verification_resume_phase": "complete",
                 })
-                self._set_current(campaign_id, account_id, target_id, cycle, "waiting")
+                await self._set_current_async(campaign_id, account_id, target_id, cycle, "waiting")
                 await self._wait_for_cycle(
                     self.timing.AFTER_STOP_SECONDS, ban_event, verification_event,
                     account_id, target_id, campaign_id,
                 )
-            self._finish_task(task, success=True)
-            await self._notify(runtime, self.get(campaign_id))
+            await self._finish_task_async(task, success=True)
+            await self._notify(runtime, await self._get_async(campaign_id))
             return True
+        except _TargetOptedOut:
+            self._fail_target_remaining(campaign, account_id, target_id, "target_opted_out")
+            await self._notify(runtime, await self._get_async(campaign_id))
+            return False
         except _VerificationPaused:
             confirmed = await self._wait_for_verification_resolution(
                 campaign_id, account_id, target_id,
@@ -933,7 +1121,7 @@ class CampaignExecutionService:
                 return await self._execute_cycle(
                     campaign, task, client, entity, cycle, runtime,
                 )
-            await self._notify(runtime, self.get(campaign_id))
+            await self._notify(runtime, await self._get_async(campaign_id))
             return False
         except _TargetAccessDenied:
             await self._await_restriction_persistence(account_id, target_id)
@@ -944,11 +1132,11 @@ class CampaignExecutionService:
                 except Exception:
                     restriction = None
             self._mark_target_restricted(campaign, account_id, target_id, restriction)
-            await self._notify(runtime, self.get(campaign_id))
+            await self._notify(runtime, await self._get_async(campaign_id))
             return False
         except _RestrictionCheckUnavailable:
             self._fail_target_remaining(campaign, account_id, target_id, "restriction_store_unavailable")
-            await self._notify(runtime, self.get(campaign_id))
+            await self._notify(runtime, await self._get_async(campaign_id))
             return False
         except FloodWaitError as exc:
             if self.ban_detection.result_for(account_id, target_id) is not None:
@@ -956,10 +1144,13 @@ class CampaignExecutionService:
                 self._mark_target_restricted(
                     campaign, account_id, target_id, self.ban_detection.result_for(account_id, target_id)
                 )
-                await self._notify(runtime, self.get(campaign_id))
+                await self._notify(runtime, await self._get_async(campaign_id))
                 return False
-            current_task = self._task_for(campaign_id, account_id, target_id) or task
-            if current_task.get("search_started") is True:
+            current_task = await self._task_for_async(campaign_id, account_id, target_id) or task
+            if (
+                current_task.get("search_started") is True
+                and await self._storage_io(self._is_target_opted_in, target_id)
+            ):
                 await self._send_stop(client, entity)
             wait_seconds = max(1, int(exc.seconds))
             wait_id = None
@@ -971,7 +1162,9 @@ class CampaignExecutionService:
                     campaign_id=campaign_id, account_id=account_id, target_id=target_id,
                     wait_id=wait_id, seconds=wait_seconds,
                 )
-            self._set_task(campaign, account_id, target_id, {"flood_wait_seconds": wait_seconds})
+            await self._set_task_async(
+                campaign, account_id, target_id, {"flood_wait_seconds": wait_seconds},
+            )
             await asyncio.sleep(wait_seconds)
             if wait_id is not None:
                 self._record_scheduled_event(
@@ -979,8 +1172,8 @@ class CampaignExecutionService:
                     wait_id=wait_id, assignment_id=self._scheduled_runtimes[account_id].assignment_id,
                     campaign_id=campaign_id, account_id=account_id, target_id=target_id,
                 )
-            self._finish_task(task, success=False, error="FloodWaitError")
-            await self._notify(runtime, self.get(campaign_id))
+            await self._finish_task_async(task, success=False, error="FloodWaitError")
+            await self._notify(runtime, await self._get_async(campaign_id))
             logger.warning("Campaign account is waiting for Telegram FloodWait (%s seconds)", wait_seconds)
             return False
         except Exception as exc:
@@ -989,20 +1182,25 @@ class CampaignExecutionService:
                 self._mark_target_restricted(
                     campaign, account_id, target_id, self.ban_detection.result_for(account_id, target_id)
                 )
-                await self._notify(runtime, self.get(campaign_id))
+                await self._notify(runtime, await self._get_async(campaign_id))
                 return False
-            current_task = self._task_for(campaign_id, account_id, target_id) or task
-            if current_task.get("search_started") is True:
+            current_task = await self._task_for_async(campaign_id, account_id, target_id) or task
+            if (
+                current_task.get("search_started") is True
+                and await self._storage_io(self._is_target_opted_in, target_id)
+            ):
                 await self._send_stop(client, entity)
             logger.warning("Campaign target cycle failed (account_id=%s, target=%s, error=%s)", account_id, username, type(exc).__name__)
-            self._finish_task(task, success=False, error=type(exc).__name__)
-            await self._notify(runtime, self.get(campaign_id))
+            await self._finish_task_async(task, success=False, error=type(exc).__name__)
+            await self._notify(runtime, await self._get_async(campaign_id))
             return False
 
     async def _recovery_stop(self, task: dict) -> None:
         account_id = str(task.get("account_id", ""))
         target_id = str(task.get("target_id", ""))
         try:
+            if not self._is_target_opted_in(target_id):
+                return
             if self._task_restriction({"account_id": account_id, "target_id": target_id}) is not None:
                 return
         except Exception:
@@ -1033,6 +1231,75 @@ class CampaignExecutionService:
 
     def _task_for(self, campaign_id: str, account_id: str, target_id: str) -> dict | None:
         return self._task_store(campaign_id).get(self._task_id(campaign_id, account_id, target_id))
+
+    async def _storage_io(self, operation, *args, **kwargs):
+        """Bound synchronous JSON lock/read/write work away from the event loop."""
+        async with self._storage_io_slots:
+            return await asyncio.to_thread(operation, *args, **kwargs)
+
+    async def _get_async(self, campaign_id: str) -> dict | None:
+        return await self._storage_io(self.get, campaign_id)
+
+    async def _task_for_async(
+        self, campaign_id: str, account_id: str, target_id: str,
+    ) -> dict | None:
+        return await self._storage_io(self._task_for, campaign_id, account_id, target_id)
+
+    async def _set_task_async(
+        self, campaign: dict, account_id: str, target_id: str, values: dict,
+    ) -> dict:
+        async with self._campaign_state_lock:
+            return await self._storage_io(
+                self._set_task, campaign, account_id, target_id, values,
+            )
+
+    async def _ensure_tasks_async(self, campaign: dict) -> None:
+        async with self._campaign_state_lock:
+            await self._storage_io(self._ensure_tasks, campaign)
+
+    async def _refresh_progress_async(self, campaign_id: str, **kwargs) -> dict:
+        async with self._campaign_state_lock:
+            return await self._storage_io(
+                self._refresh_progress, campaign_id, **kwargs,
+            )
+
+    async def _set_current_async(
+        self, campaign_id: str, account_id: str, target_id: str,
+        cycle: int, operation: str,
+    ) -> None:
+        await self._storage_io(
+            self._set_current, campaign_id, account_id, target_id, cycle, operation,
+        )
+
+    async def _restriction_for_async(
+        self, account_id: str, target_id: str, target: dict, *, target_bot_id=None,
+    ) -> dict | None:
+        return await self._storage_io(
+            self._restriction_for, account_id, target_id, target,
+            target_bot_id=target_bot_id,
+        )
+
+    async def _target_content_config_async(
+        self, campaign: dict, target_id: str,
+    ) -> dict | None:
+        return await self._storage_io(
+            self._target_content_config, campaign, target_id,
+        )
+
+    async def _raise_if_target_opted_out_async(self, target_id: str) -> None:
+        if not await self._storage_io(self._is_target_opted_in, target_id):
+            raise _TargetOptedOut
+
+    async def _raise_if_banned_async(self, account_id: str, target_id: str) -> None:
+        if self.ban_detection.result_for(account_id, target_id) is not None:
+            raise _TargetAccessDenied
+        target = await self._storage_io(self.targets.get, str(target_id)) or {}
+        try:
+            restricted = await self._restriction_for_async(account_id, target_id, target)
+        except Exception as exc:
+            raise _RestrictionCheckUnavailable from exc
+        if restricted is not None:
+            raise _TargetAccessDenied
 
     def _ensure_tasks(self, campaign: dict) -> None:
         existing = self.task_records(campaign["id"])
@@ -1112,7 +1379,9 @@ class CampaignExecutionService:
             values.setdefault("status", "in_progress")
         return store.update(task_id, values)
 
-    def _finish_task(self, task: dict, *, success: bool, error: str | None = None) -> None:
+    def _finish_task_persist(
+        self, task: dict, *, success: bool, error: str | None = None,
+    ) -> tuple[dict, int] | None:
         task_id = str(task["id"])
         store = self._task_store(str(task.get("campaign_id", "")))
         current = store.get(task_id) or task
@@ -1120,7 +1389,7 @@ class CampaignExecutionService:
         # A task's next cycle advances once. Checkpoint recovery and a late worker
         # callback cannot count the same cycle twice.
         if current.get("phase") in {None, "idle"} and int(current.get("next_cycle", 1)) > cycle:
-            return
+            return None
         changes = {
             "next_cycle": cycle + 1,
             "successful": int(current.get("successful", 0)) + int(success),
@@ -1132,6 +1401,12 @@ class CampaignExecutionService:
             "updated_at": self._now(),
         }
         store.update(task_id, changes)
+        self._refresh_progress(str(current["campaign_id"]))
+        return current, cycle
+
+    def _record_task_completion(
+        self, current: dict, cycle: int, *, success: bool, error: str | None,
+    ) -> None:
         campaign_id = str(current["campaign_id"])
         account_id = str(current.get("account_id", ""))
         if self._is_scheduled_pair(campaign_id, account_id):
@@ -1144,7 +1419,31 @@ class CampaignExecutionService:
                 target_id=str(current.get("target_id", "")), cycle=cycle,
                 assignment_id=assignment_id, error=error,
             )
-        self._refresh_progress(str(current["campaign_id"]))
+
+    def _finish_task(self, task: dict, *, success: bool, error: str | None = None) -> None:
+        completed = self._finish_task_persist(task, success=success, error=error)
+        if completed is not None:
+            current, cycle = completed
+            self._record_task_completion(current, cycle, success=success, error=error)
+
+    async def _finish_task_async(
+        self, task: dict, *, success: bool, error: str | None = None,
+    ) -> None:
+        async with self._campaign_state_lock:
+            completed = await self._storage_io(
+                self._finish_task_persist, task, success=success, error=error,
+            )
+        if completed is not None:
+            current, cycle = completed
+            self._record_task_completion(current, cycle, success=success, error=error)
+            verification_key = self._verification_key(
+                str(current.get("campaign_id", "")),
+                str(current.get("account_id", "")),
+                str(current.get("target_id", "")),
+            )
+            self._verification_events.pop(verification_key, None)
+            self._verification_confirmed_events.pop(verification_key, None)
+            self._verification_registered_monotonic_ns.pop(verification_key, None)
 
     def _fail_target_remaining(self, campaign: dict, account_id: str, target_id: str, error: str) -> None:
         task = self._task_for(campaign["id"], account_id, target_id)
@@ -1324,6 +1623,71 @@ class CampaignExecutionService:
         ))
         return attributes
 
+    def _raise_if_target_opted_out(self, target_id: str) -> None:
+        if not self._is_target_opted_in(target_id):
+            raise _TargetOptedOut
+
+    def _is_target_opted_in(self, target_id: str) -> bool:
+        target = self.targets.get(str(target_id))
+        return bool(target and target.get("opted_in") is True)
+
+    def _target_content_config(self, campaign: dict, target_id: str) -> dict | None:
+        target = self.targets.get(str(target_id))
+        if target is None or target.get("opted_in") is not True or not target.get("username"):
+            return None
+        configs = campaign.get("target_configs")
+        if isinstance(configs, dict):
+            saved = configs.get(str(target_id))
+            if not isinstance(saved, dict) or (
+                saved.get("target_id") is not None
+                and str(saved.get("target_id")) != str(target_id)
+            ):
+                return None
+        else:
+            sticker_id = campaign.get("sticker_id")
+            if not sticker_id:
+                return None
+            saved = {
+                "target_id": str(target_id),
+                "text_enabled": True,
+                "promotional_text": None,
+                "legacy_rotating_text": True,
+                "sticker_enabled": True,
+                "sticker_id": str(sticker_id),
+            }
+        text_enabled = saved.get("text_enabled") is True
+        sticker_enabled = saved.get("sticker_enabled") is True
+        if not text_enabled and not sticker_enabled:
+            return None
+        promotional_text = saved.get("promotional_text")
+        legacy_rotating_text = saved.get("legacy_rotating_text") is True
+        if text_enabled and not legacy_rotating_text and (
+            not isinstance(promotional_text, str) or not promotional_text.strip()
+            or len(promotional_text.strip()) > 4096
+        ):
+            return None
+        sticker_id = saved.get("sticker_id")
+        if sticker_enabled:
+            if not isinstance(sticker_id, str):
+                return None
+            try:
+                self._sticker_path(sticker_id)
+            except (RuntimeError, OSError, ValueError):
+                return None
+        return {
+            "target_id": str(target_id),
+            "target_username": str(target["username"]),
+            "target_display_name": f"@{target['username']}",
+            "text_enabled": text_enabled,
+            "promotional_text": (
+                promotional_text.strip()
+                if text_enabled and isinstance(promotional_text, str) else None
+            ),
+            "legacy_rotating_text": legacy_rotating_text,
+            "sticker_enabled": sticker_enabled,
+            "sticker_id": str(sticker_id) if sticker_enabled else None,
+        }
+
     def _validated_campaign(self, campaign_id: str) -> dict | None:
         campaign = self.get(campaign_id)
         if campaign is None:
@@ -1342,17 +1706,35 @@ class CampaignExecutionService:
             target = self.targets.get(str(target_id))
             if target is None or target.get("opted_in") is not True or not target.get("username"):
                 return None
+            if self._target_content_config(campaign, str(target_id)) is None:
+                return None
         try:
             cycles = int(campaign.get("total_cycles", 0))
         except (TypeError, ValueError):
             return None
-        if cycles < 1 or cycles > 100000 or self.stickers.get(str(campaign.get("sticker_id", ""))) is None:
+        if cycles < 1 or cycles > 100000:
+            return None
+        configs = campaign.get("target_configs")
+        if isinstance(configs, dict) and set(configs) != {str(value) for value in target_ids}:
+            return None
+        execution_mode = campaign.get("execution_mode", "sequential")
+        if execution_mode not in {"sequential", "parallel"}:
+            return None
+        try:
+            concurrency_limit = int(campaign.get("concurrency_limit", 3))
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= concurrency_limit <= 5:
             return None
         changes = {}
         if campaign.get("account_ids") != account_ids:
             changes["account_ids"] = account_ids
         if campaign.get("total_cycles") != cycles:
             changes["total_cycles"] = cycles
+        if campaign.get("execution_mode") != execution_mode:
+            changes["execution_mode"] = execution_mode
+        if campaign.get("concurrency_limit") != concurrency_limit:
+            changes["concurrency_limit"] = concurrency_limit
         try:
             rotation_index = max(0, int(campaign.get("rotation_index", 0)))
         except (ValueError, TypeError):
@@ -1707,22 +2089,31 @@ class CampaignExecutionService:
         if self.restriction_service is not None:
             try:
                 loop = asyncio.get_running_loop()
-                self._restriction_tasks[key] = loop.create_task(
+                task = loop.create_task(
                     self.restriction_service.handle_detection(result)
+                )
+                self._restriction_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed, pair=key: self._restriction_task_done(pair, completed),
                 )
             except RuntimeError:
                 logger.exception("Could not schedule restriction persistence (detection_id=%s)", result.detection_id)
 
-    def _raise_if_banned(self, account_id: str, target_id: str) -> None:
-        target = self.targets.get(str(target_id)) or {}
-        if self.ban_detection.result_for(account_id, target_id) is not None:
-            raise _TargetAccessDenied
-        try:
-            restricted = self._restriction_for(account_id, target_id, target)
-        except Exception as exc:
-            raise _RestrictionCheckUnavailable from exc
-        if restricted is not None:
-            raise _TargetAccessDenied
+    def _restriction_task_done(
+        self, key: tuple[str, str], task: asyncio.Task,
+    ) -> None:
+        if task.cancelled():
+            self._restriction_tasks.pop(key, None)
+            return
+        error = task.exception()
+        if error is None:
+            if self._restriction_tasks.get(key) is task:
+                self._restriction_tasks.pop(key, None)
+            return
+        logger.error(
+            "Restriction persistence task failed (account_id=%s, target_id=%s, error=%s)",
+            key[0], key[1], type(error).__name__,
+        )
 
     async def _await_restriction_persistence(self, account_id: str, target_id: str) -> None:
         task = self._restriction_tasks.get((str(account_id), str(target_id)))
@@ -1739,7 +2130,7 @@ class CampaignExecutionService:
         campaign_id: str,
     ) -> None:
         if ban_event.is_set():
-            self._raise_if_banned(account_id, target_id)
+            await self._raise_if_banned_async(account_id, target_id)
         if verification_event.is_set():
             self._raise_if_verification_paused(account_id, target_id, campaign_id)
         if seconds > 0:
@@ -1756,7 +2147,7 @@ class CampaignExecutionService:
                 await asyncio.gather(*pending, return_exceptions=True)
             except asyncio.TimeoutError:
                 return
-            self._raise_if_banned(account_id, target_id)
+            await self._raise_if_banned_async(account_id, target_id)
             if verification_event.is_set():
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
 
@@ -1764,7 +2155,7 @@ class CampaignExecutionService:
         if runtime.callback is not None and campaign is not None:
             async with runtime.notify_lock:
                 try:
-                    latest = self.get(str(campaign.get("id", ""))) or campaign
+                    latest = await self._get_async(str(campaign.get("id", ""))) or campaign
                     await runtime.callback(latest)
                 except Exception as exc:
                     logger.debug("Campaign progress callback failed (error=%s)", type(exc).__name__)
@@ -1773,7 +2164,7 @@ class CampaignExecutionService:
         """Refresh the single dashboard message periodically during long cycles."""
         while True:
             await asyncio.sleep(5)
-            campaign = self.get(campaign_id)
+            campaign = await self._get_async(campaign_id)
             if campaign is None or campaign.get("status") != "running":
                 return
             await self._notify(runtime, campaign)

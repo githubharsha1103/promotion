@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from collections.abc import Awaitable
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from app.config import get_settings
 from app.control_bot import ControlBotService
@@ -122,7 +122,19 @@ app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
 @app.get("/health", tags=["health"])
-async def health_check() -> dict[str, str]:
-    """Report that the web application process is responding."""
+async def health_check(request: Request) -> dict:
+    """Report web and control-bot lifecycle health without blocking on Telegram."""
 
-    return {"status": "ok"}
+    control_bot = getattr(request.app.state, "control_bot_service", None)
+    if control_bot is None:
+        return {"status": "starting", "control_bot": {"state": "starting"}}
+    snapshot = control_bot.health_snapshot()
+    configured = bool(
+        settings.control_bot_token.get_secret_value() and settings.admin_id is not None
+    )
+    if not configured:
+        return {"status": "ok", "control_bot": {"state": "disabled"}}
+    status = "ok" if snapshot["polling"] else (
+        "starting" if snapshot["state"] == "restarting" else "degraded"
+    )
+    return {"status": status, "control_bot": snapshot}

@@ -3,14 +3,16 @@ import asyncio
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import logging
+import os
 from pathlib import Path
 import re
 import secrets
+import time
 import uuid
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -47,6 +49,10 @@ _RECORD_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 _USERNAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 _CAMPAIGN_NAME_PATTERN = re.compile(r"^.{1,80}$", re.DOTALL)
 _TEXT_LIMIT = 4096
+_MAX_DEFERRED_CONTROL_OPERATIONS = 4
+_POLL_HEALTH_INTERVAL_SECONDS = 10.0
+_TELEGRAM_PROBE_INTERVAL_SECONDS = 60.0
+_TELEGRAM_PROBE_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass
@@ -119,6 +125,8 @@ class ControlBotService:
         self._shutdown_requested = False
         self._startup_task: asyncio.Task[None] | None = None
         self._expiry_task: asyncio.Task[None] | None = None
+        self._background_control_tasks: set[asyncio.Task] = set()
+        self._background_control_keys: set[str] = set()
         self._auth_flows: dict[tuple[int, int], BotAuthenticationFlow] = {}
         self._active_flow_key: tuple[int, int] | None = None
         self._removal_confirmations: dict[str, RemovalConfirmation] = {}
@@ -128,6 +136,21 @@ class ControlBotService:
         self._flow_lock = asyncio.Lock()
         self._campaign_last_edit: dict[str, float] = {}
         self._suspended_resume_tokens: dict[str, tuple[str, str]] = {}
+        self._last_successful_update_at: str | None = None
+        self._last_polling_error: str | None = None
+        self._polling_restart_count = 0
+        self._background_failure_count = 0
+        self._last_background_failure_at: str | None = None
+        self._failed_update_ids: set[int] = set()
+        self._last_event_loop_lag_seconds = 0.0
+        self._process_cpu_percent = 0.0
+        self._process_memory_bytes: int | None = None
+        self._last_cpu_time = time.process_time()
+        self._last_cpu_sample = time.monotonic()
+        self._telegram_connected: bool | None = None
+        self._consecutive_probe_failures = 0
+        self._polling_failure_event = asyncio.Event()
+        self._control_loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> bool:
         """Start one polling supervisor; temporary API failures are retried in the background."""
@@ -142,16 +165,19 @@ class ControlBotService:
         ):
             return True
         self._shutdown_requested = False
+        self._control_loop = asyncio.get_running_loop()
         self._startup_task = asyncio.create_task(
             self._start_with_retry(token), name="control-bot-startup",
         )
         return True
 
     def _build_application(self, token: str) -> Application:
-        application = Application.builder().token(token).build()
+        application = Application.builder().token(token).concurrent_updates(4).build()
         application.bot_data["control_bot_service"] = self
         # This handler runs first and stops processing for unauthorized updates.
         application.add_handler(TypeHandler(Update, self._authorize_update), group=-100)
+        application.add_handler(TypeHandler(Update, self._record_processed_update), group=100)
+        application.add_error_handler(self._record_handler_error)
         application.add_handler(CommandHandler("start", self._start_command))
         application.add_handler(CommandHandler("help", self._help_command))
         application.add_handler(CommandHandler("status", self._status_command))
@@ -189,7 +215,9 @@ class ControlBotService:
         attempt = 0
         delay = 1.0
         while not self._shutdown_requested:
+            started_at = time.monotonic()
             try:
+                self._polling_failure_event.clear()
                 application = self._build_application(token)
                 self._application = application
                 await application.initialize()
@@ -198,52 +226,201 @@ class ControlBotService:
                 self._started = True
                 if application.updater is None:
                     raise RuntimeError("Polling updater is unavailable")
-                await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+                await application.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    error_callback=self._polling_error_callback,
+                )
                 self._polling = True
                 self._expiry_task = asyncio.create_task(self._expire_authentication_flows())
                 logger.info("Control bot polling started")
-                return
+                await self._monitor_polling(application)
+                if self._shutdown_requested:
+                    return
+                raise RuntimeError("Control bot polling stopped unexpectedly")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 attempt += 1
+                self._polling_restart_count += 1
+                self._last_polling_error = type(exc).__name__
                 logger.warning(
-                    "Control bot startup attempt %d failed; retrying (error=%s)",
+                    "Control bot polling attempt %d failed; retrying (error=%s)",
                     attempt, type(exc).__name__,
                 )
-                await self._close_application()
+                await self._notify_polling_recovery(exc)
+                if not await self._close_application():
+                    logger.critical(
+                        "Control bot polling shutdown was not confirmed; refusing to create another poller",
+                    )
+                    self._shutdown_requested = True
+                    return
                 if self._shutdown_requested:
                     return
                 try:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     raise
+                if time.monotonic() - started_at >= 300:
+                    attempt = 0
+                    delay = 1.0
                 delay = min(60.0, delay * 2)
 
-    async def _close_application(self) -> None:
+    async def _monitor_polling(self, application: Application) -> None:
+        loop = asyncio.get_running_loop()
+        next_probe = loop.time()
+        while not self._shutdown_requested:
+            expected = loop.time() + _POLL_HEALTH_INTERVAL_SECONDS
+            await asyncio.sleep(_POLL_HEALTH_INTERVAL_SECONDS)
+            now = loop.time()
+            self._last_event_loop_lag_seconds = max(0.0, now - expected)
+            self._sample_process_metrics()
+            updater = application.updater
+            if updater is None or not updater.running:
+                raise RuntimeError("Telegram polling updater is not running")
+            if self._polling_failure_event.is_set():
+                raise RuntimeError("Telegram polling conflict detected")
+            if now < next_probe:
+                continue
+            try:
+                await asyncio.wait_for(
+                    application.bot.get_me(),
+                    timeout=_TELEGRAM_PROBE_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._consecutive_probe_failures += 1
+                self._telegram_connected = False
+                logger.warning(
+                    "Control bot connectivity probe failed (%d consecutive; error=%s)",
+                    self._consecutive_probe_failures, type(exc).__name__,
+                )
+                if self._consecutive_probe_failures >= 3:
+                    raise RuntimeError("Telegram Bot API health probes failed") from exc
+            else:
+                self._telegram_connected = True
+                self._consecutive_probe_failures = 0
+            next_probe = now + _TELEGRAM_PROBE_INTERVAL_SECONDS
+
+    def _polling_error_callback(self, error: Exception) -> None:
+        self._last_polling_error = type(error).__name__
+        if isinstance(error, Conflict) and self._control_loop is not None:
+            self._control_loop.call_soon_threadsafe(self._polling_failure_event.set)
+
+    def _sample_process_metrics(self) -> None:
+        now = time.monotonic()
+        cpu_time = time.process_time()
+        elapsed = now - self._last_cpu_sample
+        if elapsed > 0:
+            self._process_cpu_percent = max(
+                0.0, (cpu_time - self._last_cpu_time) / elapsed * 100.0,
+            )
+        self._last_cpu_time = cpu_time
+        self._last_cpu_sample = now
+        try:
+            statm = Path("/proc/self/statm").read_text(encoding="ascii").split()
+            self._process_memory_bytes = int(statm[1]) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError, AttributeError):
+            self._process_memory_bytes = None
+
+    def health_snapshot(self) -> dict:
         application = self._application
-        if application is None:
+        updater = application.updater if application is not None else None
+        polling = bool(self._polling and updater is not None and updater.running)
+        state = "running" if polling else (
+            "restarting" if self._startup_task is not None and not self._startup_task.done()
+            else "stopped"
+        )
+        return {
+            "state": state,
+            "polling": polling,
+            "telegram_connected": self._telegram_connected,
+            "last_successful_update_at": self._last_successful_update_at,
+            "last_polling_error": self._last_polling_error,
+            "polling_restart_count": self._polling_restart_count,
+            "event_loop_lag_seconds": round(self._last_event_loop_lag_seconds, 3),
+            "process_cpu_percent": round(self._process_cpu_percent, 2),
+            "process_memory_bytes": self._process_memory_bytes,
+            "background_control_tasks": len(self._background_control_tasks),
+            "background_failure_count": self._background_failure_count,
+            "last_background_failure_at": self._last_background_failure_at,
+        }
+
+    async def _notify_polling_recovery(self, error: Exception) -> None:
+        application = self._application
+        if application is None or self.settings.admin_id is None:
             return
+        try:
+            await asyncio.wait_for(
+                application.bot.send_message(
+                    chat_id=self.settings.admin_id,
+                    text=(
+                        "Control-bot polling is recovering. Existing campaign state is preserved. "
+                        f"Failure: {type(error).__name__}; retry is backoff-limited."
+                    ),
+                ),
+                timeout=5.0,
+            )
+        except Exception as notify_error:
+            logger.info(
+                "Could not notify owner about control-bot recovery (error=%s)",
+                type(notify_error).__name__,
+            )
+
+    async def _record_processed_update(
+        self, update: Update, _context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if update.update_id not in self._failed_update_ids:
+            self._last_successful_update_at = datetime.now(timezone.utc).isoformat()
+        self._failed_update_ids.discard(update.update_id)
+
+    async def _record_handler_error(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        error = context.error
+        self._background_failure_count += 1
+        self._last_background_failure_at = datetime.now(timezone.utc).isoformat()
+        self._failed_update_ids.add(update.update_id)
+        if len(self._failed_update_ids) > 128:
+            self._failed_update_ids.pop()
+        logger.error(
+            "Control bot update handler failed (error=%s)",
+            type(error).__name__ if error is not None else "unknown",
+        )
+
+    async def _close_application(self) -> bool:
+        application = self._application
+        expiry_task = self._expiry_task
+        if expiry_task is not None:
+            self._expiry_task = None
+            if not expiry_task.done():
+                expiry_task.cancel()
+            await asyncio.gather(expiry_task, return_exceptions=True)
+        if application is None:
+            return True
         updater = application.updater
         if updater is not None and (self._polling or updater.running):
             try:
-                await updater.stop()
+                await asyncio.wait_for(updater.stop(), timeout=20.0)
             except Exception as exc:
                 logger.warning("Control bot polling shutdown failed (error=%s)", type(exc).__name__)
-        self._polling = False
+        polling_stopped = updater is None or not updater.running
+        self._polling = not polling_stopped
 
         if self._started or application.running:
             try:
-                await application.stop()
+                await asyncio.wait_for(application.stop(), timeout=20.0)
             except Exception as exc:
                 logger.warning("Control bot application shutdown failed (error=%s)", type(exc).__name__)
         self._started = False
         try:
-            await application.shutdown()
+            await asyncio.wait_for(application.shutdown(), timeout=20.0)
         except Exception as exc:
             logger.warning("Control bot resource cleanup failed (error=%s)", type(exc).__name__)
         self._initialized = False
-        self._application = None
+        if polling_stopped:
+            self._application = None
+        return polling_stopped
 
     async def stop(self) -> None:
         """Stop startup/polling and discard pending account authentication flows."""
@@ -257,6 +434,12 @@ class ControlBotService:
             except asyncio.CancelledError:
                 pass
         self._startup_task = None
+        background_tasks = list(self._background_control_tasks)
+        if background_tasks:
+            _, pending = await asyncio.wait(background_tasks, timeout=5.0)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*background_tasks, return_exceptions=True)
         await self._close_application()
 
         if self._expiry_task is not None:
@@ -511,7 +694,8 @@ class ControlBotService:
             return
         status = data["status"]
         settings = status["settings"]
-        target_username = str(data.get("target_username") or "unavailable").lstrip("@")
+        target_usernames = data.get("target_usernames") or [data.get("target_username") or "unavailable"]
+        target_username = ", @".join(str(name).lstrip("@") for name in target_usernames)
         if status.get("recovery_required"):
             state = "Awaiting recovery confirmation"
         elif status.get("manually_paused"):
@@ -532,7 +716,8 @@ class ControlBotService:
         period = period_names.get(str(status.get("operating_period")), "Outside Operating Hours")
         lines = [
             f"🚀 {data['promotion'].get('name', 'Promotion')}",
-            f"🤖 Target: @{target_username}",
+            f"🤖 Targets ({len(target_usernames)}): @{target_username}",
+            f"🔀 Target order: {data['promotion'].get('execution_mode', 'sequential')}",
             f"⚙️ Status: {state}",
             f"🕒 Period: {period}",
             f"🔁 Cycles: {data['window_completed_cycles']} this window · "
@@ -549,7 +734,8 @@ class ControlBotService:
             f"{settings['peak_concurrency']} · off-peak "
             f"{settings['outside_peak_concurrency_1_20']}/"
             f"{settings['outside_peak_concurrency_21_50']}/"
-            f"{settings['outside_peak_concurrency_51_plus']} (by account tier)",
+            f"{settings['outside_peak_concurrency_51_plus']} (by account tier) · "
+            f"parallel targets {settings['parallel_target_concurrency']}",
         ]
         buttons = []
         if status.get("recovery_required"):
@@ -571,7 +757,7 @@ class ControlBotService:
              InlineKeyboardButton("🏠 Home", callback_data="dash:home")],
         ])
         if not data.get("promotion_content_available"):
-            lines.append("\nSticker content is not available; add a sticker before starting.")
+            lines.append("\nPromotional content is unavailable; configure text and/or a sticker for every target.")
         await self._edit_dashboard_message(
             query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -587,6 +773,7 @@ class ControlBotService:
             "outside_peak_concurrency_1_20": "Off-peak · 1–20",
             "outside_peak_concurrency_21_50": "Off-peak · 21–50",
             "outside_peak_concurrency_51_plus": "Off-peak · 51+",
+            "parallel_target_concurrency": "Parallel target limit",
             "progress_report_time": "Progress report",
             "final_report_time": "Final report",
         }
@@ -628,6 +815,7 @@ class ControlBotService:
             f"{settings.outside_peak_concurrency_1_20} / "
             f"{settings.outside_peak_concurrency_21_50} / "
             f"{settings.outside_peak_concurrency_51_plus}\n"
+            f"🔀 Parallel target limit: {settings.parallel_target_concurrency}\n"
             f"📨 Daily reports: {self._format_dashboard_time(settings.progress_report_time)} "
             "progress · "
             f"{self._format_dashboard_time(settings.final_report_time)} final (IST)\n\n"
@@ -776,14 +964,15 @@ class ControlBotService:
             return
         if kind == "current":
             settings = self.scheduler_service.settings
-            report = self.reporting_service.build_current_report(
+            report = await asyncio.to_thread(
+                self.reporting_service.build_current_report,
                 scheduler_enabled=self.scheduler_service.enabled,
                 operating_start=settings.operating_start,
                 operating_end=settings.operating_end,
                 scheduler_status=self.scheduler_service.state.value,
             )
         else:
-            report = self.reporting_service.latest(kind)
+            report = await asyncio.to_thread(self.reporting_service.latest, kind)
         if report is None:
             await self._edit_dashboard_message(
                 query, "No saved report is available yet.",
@@ -807,10 +996,14 @@ class ControlBotService:
 
     async def _show_promotion_targets(self, message_or_query, page: int = 0, edit: bool = False) -> None:
         targets = self._targets(opted_in_only=True)
+        key = (self.settings.admin_id, self._chat_id(message_or_query))
+        workflow = self._workflows.get(key)
+        selected = set(workflow.data.get("target_ids", [])) if workflow and workflow.kind == "promotion_config" else set()
         pages = max(1, (len(targets) + _PAGE_SIZE - 1) // _PAGE_SIZE)
         page = min(max(0, int(page)), pages - 1)
         rows = [[InlineKeyboardButton(
-            f"@{item['username']}", callback_data=f"promo:target:{item['id']}"
+            f"{'☑' if item['id'] in selected else '☐'} @{item['username']}"[:60],
+            callback_data=f"promo:target:{item['id']}"
         )] for item in targets[page * _PAGE_SIZE:(page + 1) * _PAGE_SIZE]]
         if pages > 1:
             nav = []
@@ -820,6 +1013,8 @@ class ControlBotService:
             if page + 1 < pages:
                 nav.append(InlineKeyboardButton("Next", callback_data=f"promo:targets:{page + 1}"))
             rows.append(nav)
+        if selected:
+            rows.append([InlineKeyboardButton("Continue", callback_data="promo:targets_done")])
         rows.append([InlineKeyboardButton("Cancel", callback_data="promo:cancel")])
         markup = self._with_flow_navigation(InlineKeyboardMarkup(rows), self._chat_id(message_or_query))
         text = "Select an existing target bot with confirmed opt-in:"
@@ -1304,7 +1499,7 @@ class ControlBotService:
         if message is None:
             return
         try:
-            accounts = self._authenticated_accounts()
+            accounts = await asyncio.to_thread(self._authenticated_accounts)
         except Exception as exc:
             logger.warning("Could not read account count for control bot (error=%s)", type(exc).__name__)
             await message.reply_text("Application status: running\nSaved Telegram accounts: unavailable")
@@ -1368,7 +1563,7 @@ class ControlBotService:
         action: str,
         page: int = 0,
     ) -> None:
-        accounts = self._authenticated_accounts()
+        accounts = await asyncio.to_thread(self._authenticated_accounts)
         if not accounts:
             await message.reply_text("No authenticated Telegram accounts are saved.", reply_markup=self._dashboard_navigation(None, message.chat_id))
             return
@@ -1462,6 +1657,36 @@ class ControlBotService:
         if update.effective_message is not None:
             await self._account_picker(update.effective_message, "remove")
 
+    @staticmethod
+    def _deferred_callback_key(data: str) -> str | None:
+        parts = data.split(":")
+        if len(parts) == 3 and parts[0] == "campaign_control":
+            return f"campaign:{parts[2]}"
+        if len(parts) == 2 and parts[0] in {"scheduler_recovery", "content_save"}:
+            return "scheduler" if parts[0] == "scheduler_recovery" else "confirmation"
+        if len(parts) == 2 and parts[0] in {"reconnect", "disconnect", "test_account"}:
+            return f"account:{parts[1]}"
+        if len(parts) == 4 and parts[0] == "sticker_select" and parts[1] == "test":
+            return f"account:test:{parts[2]}"
+        if parts[0] == "promo" and (
+            data in {
+                "promo:save", "promo:start", "promo:pause", "promo:resume",
+                "promo:refresh",
+            }
+            or (len(parts) == 3 and parts[1] == "activity_refresh")
+            or (len(parts) == 3 and parts[1] == "report")
+        ):
+            return "scheduler" if parts[1] != "report" else "report"
+        if data == "scheduler:toggle":
+            return "scheduler"
+        if len(parts) == 4 and parts[:3] == ["dash", "action", "settings"] and parts[3] in {
+            "scheduler_toggle", "scheduler_recovery",
+        }:
+            return "scheduler"
+        if len(parts) == 2 and parts[0] in {"action_yes", "remove_yes"}:
+            return "confirmation"
+        return None
+
     async def _callback_router(
         self,
         update: Update,
@@ -1470,7 +1695,63 @@ class ControlBotService:
         query = update.callback_query
         if query is None:
             return
-        await query.answer()
+        data = query.data or ""
+        operation_key = self._deferred_callback_key(data)
+        if operation_key is None:
+            await query.answer()
+            await self._route_callback(update, context)
+            return
+        if operation_key in self._background_control_keys:
+            await query.answer("That control operation is already in progress.", show_alert=True)
+            return
+        if len(self._background_control_tasks) >= _MAX_DEFERRED_CONTROL_OPERATIONS:
+            await query.answer("Control service is busy. Please retry shortly.", show_alert=True)
+            return
+        await query.answer("Request accepted; processing in the background.")
+        self._background_control_keys.add(operation_key)
+        task = asyncio.create_task(
+            self._run_deferred_callback(update, context, operation_key),
+            name=f"control-operation-{operation_key[:40]}",
+        )
+        self._background_control_tasks.add(task)
+        task.add_done_callback(self._background_control_tasks.discard)
+
+    async def _run_deferred_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, operation_key: str,
+    ) -> None:
+        try:
+            await self._route_callback(update, context)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._background_failure_count += 1
+            self._last_background_failure_at = datetime.now(timezone.utc).isoformat()
+            logger.exception(
+                "Deferred control operation failed (operation=%s, error=%s)",
+                operation_key, type(exc).__name__,
+            )
+            query = update.callback_query
+            if query is not None:
+                try:
+                    await query.edit_message_text(
+                        "The operation failed. Existing campaign and account records were retained where possible.",
+                    )
+                except Exception as notify_error:
+                    logger.info(
+                        "Could not report deferred control failure (error=%s)",
+                        type(notify_error).__name__,
+                    )
+        finally:
+            self._background_control_keys.discard(operation_key)
+
+    async def _route_callback(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        query = update.callback_query
+        if query is None:
+            return
         data = query.data or ""
         parts = data.split(":")
         if data == "noop":
@@ -1516,6 +1797,10 @@ class ControlBotService:
         if parts[0] == "promo":
             if self.scheduler_service is None or query.message is None:
                 await query.edit_message_text("Promotion scheduling is unavailable.")
+                return
+            admin_id = self.settings.admin_id
+            if admin_id is None:
+                await query.edit_message_text("Owner configuration is unavailable.")
                 return
             if len(parts) == 2 and parts[1] in {"dashboard", "refresh"}:
                 await self._show_promotion_dashboard(query, 0, refresh=parts[1] == "refresh")
@@ -1567,7 +1852,7 @@ class ControlBotService:
                         query, "Promotion settings can only be changed in a private chat.",
                     )
                     return
-                key = (self.settings.admin_id, query.message.chat_id)
+                key = (admin_id, query.message.chat_id)
                 if not self._begin_workflow(
                     key, "promotion_setting", "value", {"setting": setting_name},
                 ):
@@ -1590,7 +1875,7 @@ class ControlBotService:
                 if query.message.chat.type != "private":
                     await query.edit_message_text("Configure the promotion in a private chat with this bot.")
                     return
-                key = (self.settings.admin_id, query.message.chat_id)
+                key = (admin_id, query.message.chat_id)
                 if not self._begin_workflow(key, "promotion_config", "name", {}):
                     await query.edit_message_text("Finish or cancel the active dashboard workflow first.")
                     return
@@ -1600,7 +1885,7 @@ class ControlBotService:
                 )
                 return
             if parts == ["promo", "cancel"]:
-                key = (self.settings.admin_id, query.message.chat_id)
+                key = (admin_id, query.message.chat_id)
                 self._workflows.pop(key, None)
                 await self._show_promotion_dashboard(query)
                 return
@@ -1611,20 +1896,104 @@ class ControlBotService:
                 if query.message.chat.type != "private":
                     await query.edit_message_text("Configure the promotion in a private chat with this bot.")
                     return
-                key = (self.settings.admin_id, query.message.chat_id)
+                key = (admin_id, query.message.chat_id)
                 workflow = self._workflows.get(key)
                 target = self._target_by_id(parts[2])
                 if (workflow is None or workflow.kind != "promotion_config" or workflow.step != "target"
                         or target is None or target.get("opted_in") is not True):
                     await query.edit_message_text("This target selection is stale. Open Configure Promotion again.")
                     return
+                selected = set(workflow.data.get("target_ids", []))
+                if parts[2] in selected:
+                    selected.remove(parts[2])
+                else:
+                    selected.add(parts[2])
+                workflow.data["target_ids"] = sorted(selected)
+                await self._show_promotion_targets(query, edit=True)
+                return
+            if parts == ["promo", "targets_done"]:
+                key = (admin_id, query.message.chat_id)
+                workflow = self._workflows.get(key)
+                target_ids = workflow.data.get("target_ids", []) if workflow else []
+                if (workflow is None or workflow.kind != "promotion_config"
+                        or workflow.step != "target" or not target_ids):
+                    await query.edit_message_text("Select at least one opted-in target.")
+                    return
+                missing = [
+                    str(target_id) for target_id in target_ids
+                    if self._campaign_target_content_config(str(target_id)) is None
+                ]
+                if missing:
+                    await query.edit_message_text(
+                        "Configure valid text and/or sticker content for every selected target first. "
+                        "Open Targets, choose each target, then Configure content.",
+                        reply_markup=self._dashboard_navigation(None, query.message.chat_id, back_data="dash:section:targets"),
+                    )
+                    return
+                workflow.step = "execution_mode"
+                await query.edit_message_text(
+                    "Choose target execution order:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("Sequential", callback_data="promo:mode:sequential"),
+                            InlineKeyboardButton("Parallel", callback_data="promo:mode:parallel"),
+                        ],
+                        [InlineKeyboardButton("Cancel", callback_data="promo:cancel")],
+                    ]),
+                )
+                return
+            if len(parts) == 3 and parts[1] == "mode" and parts[2] in {"sequential", "parallel"}:
+                key = (admin_id, query.message.chat_id)
+                workflow = self._workflows.get(key)
+                if (workflow is None or workflow.kind != "promotion_config"
+                        or workflow.step != "execution_mode"):
+                    await query.edit_message_text("This execution mode selection is stale.")
+                    return
+                workflow.data["execution_mode"] = parts[2]
+                workflow.step = "confirm"
+                target_lines = []
+                for target_id in workflow.data.get("target_ids", []):
+                    config = self._campaign_target_content_config(str(target_id)) or {}
+                    target_lines.append(
+                        self._format_target_content_summary(str(target_id), config)
+                    )
+                extra_targets = max(0, len(target_lines) - 12)
+                summary = (
+                    f"Scheduled promotion summary\nName: {workflow.data.get('name', 'Promotion')}\n"
+                    f"Execution: {parts[2]}\nTargets:\n" + "\n".join(target_lines[:12])
+                    + (f"\n+ {extra_targets} additional targets" if extra_targets else "")
+                    + "\n\nSave this configuration? Only explicitly opted-in targets are eligible."
+                )
+                await query.edit_message_text(summary, reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Save configuration", callback_data="promo:save"),
+                    InlineKeyboardButton("Cancel", callback_data="promo:cancel"),
+                ]]))
+                return
+            if parts == ["promo", "save"]:
+                key = (admin_id, query.message.chat_id)
+                workflow = self._workflows.get(key)
+                if (workflow is None or workflow.kind != "promotion_config"
+                        or workflow.step != "confirm"):
+                    await query.edit_message_text("This promotion save confirmation is stale.")
+                    return
                 try:
                     await self.scheduler_service.save_promotion_config(
-                        str(workflow.data.get("name", "")), str(target["id"]),
+                        str(workflow.data.get("name", "")),
+                        list(workflow.data.get("target_ids", [])),
+                        str(workflow.data.get("execution_mode", "sequential")),
                     )
                 except ValueError as exc:
                     await query.edit_message_text(str(exc), reply_markup=self._dashboard_navigation(
                         None, query.message.chat_id, back_data="promo:dashboard"))
+                    return
+                except JsonStoreError as exc:
+                    logger.error("Could not save scheduled promotion configuration (error=%s)", type(exc).__name__)
+                    await query.edit_message_text(
+                        "Scheduled promotion settings could not be saved. Existing settings remain active.",
+                        reply_markup=self._dashboard_navigation(
+                            None, query.message.chat_id, back_data="promo:dashboard",
+                        ),
+                    )
                     return
                 self._workflows.pop(key, None)
                 await self._show_promotion_dashboard(query)
@@ -1785,6 +2154,86 @@ class ControlBotService:
             else:
                 await self._show_campaign_progress(query, campaign, int(parts[2]))
             return
+        if len(parts) == 2 and parts[0] == "campaign_content":
+            campaign = self._get_campaign(parts[1])
+            if (
+                campaign is None or query.message is None
+                or query.message.chat.type != "private"
+                or self.settings.admin_id is None
+            ):
+                await query.edit_message_text("Campaign content editing is unavailable or stale.")
+            elif campaign.get("status") == "running":
+                await query.edit_message_text("Pause or stop the campaign before editing target content.")
+            else:
+                key = (self.settings.admin_id, query.message.chat_id)
+                if not self._begin_workflow(
+                    key, "campaign_content", "target", {"campaign_id": parts[1]},
+                ):
+                    await query.edit_message_text("Finish or cancel the active workflow first.")
+                else:
+                    await self._show_campaign_content_targets(
+                        query, campaign, edit=True,
+                    )
+            return
+        if len(parts) == 3 and parts[0] == "campaign_content_target":
+            campaign_id, index_text = parts[1], parts[2]
+            campaign = self._get_campaign(campaign_id)
+            admin_id = self.settings.admin_id
+            if admin_id is None or query.message is None:
+                await query.edit_message_text("This campaign target selection is stale.")
+                return
+            key = (admin_id, query.message.chat_id)
+            workflow = self._workflows.get(key)
+            if (
+                workflow is None or workflow.kind != "campaign_content"
+                or workflow.step != "target"
+                or workflow.data.get("campaign_id") != campaign_id
+                or campaign is None or not index_text.isdigit()
+                or int(index_text) >= len(campaign.get("target_ids", []))
+            ):
+                await query.edit_message_text("This campaign target selection is stale.")
+                return
+            target_id = str(campaign["target_ids"][int(index_text)])
+            content_configs = self._campaign_content_configs(campaign) or {}
+            config = content_configs.get(target_id)
+            if config is None:
+                await query.edit_message_text("This target's content is unavailable.")
+                return
+            self._workflows[key] = Workflow(
+                kind="target_content", step="settings",
+                data={
+                    "target_id": target_id,
+                    "text_enabled": config["text_enabled"],
+                    "promotional_text": config.get("promotional_text") or "",
+                    "sticker_enabled": config["sticker_enabled"],
+                    "sticker_id": config.get("sticker_id") or "",
+                    "scope": "campaign",
+                    "campaign_id": campaign_id,
+                },
+                expires_at=datetime.now(timezone.utc) + _FLOW_TIMEOUT,
+            )
+            await self._show_target_content_config(query, self._workflows[key], edit=True)
+            return
+        if len(parts) == 3 and parts[0] == "campaign_content_page":
+            campaign_id, page_text = parts[1], parts[2]
+            campaign = self._get_campaign(campaign_id)
+            admin_id = self.settings.admin_id
+            if admin_id is None or query.message is None:
+                await query.edit_message_text("This campaign target page is stale.")
+                return
+            key = (admin_id, query.message.chat_id)
+            workflow = self._workflows.get(key)
+            if (
+                workflow is None or workflow.kind != "campaign_content"
+                or workflow.step != "target" or workflow.data.get("campaign_id") != campaign_id
+                or campaign is None or not page_text.isdigit() or int(page_text) > 100000
+            ):
+                await query.edit_message_text("This campaign target page is stale.")
+            else:
+                await self._show_campaign_content_targets(
+                    query, campaign, int(page_text), edit=True,
+                )
+            return
         if len(parts) == 2 and parts[0] == "suspended_page" and parts[1].isdigit():
             await self._suspended_campaigns_page(query, int(parts[1]))
             return
@@ -1799,7 +2248,7 @@ class ControlBotService:
             else:
                 await query.edit_message_text("Send the new total cycles per target (1-100000).", reply_markup=self._flow_navigation(query.message.chat_id))
             return
-        if len(parts) == 2 and parts[0] in {"targets_page", "target_optin", "target_remove", "target_edit", "sticker_remove", "message_view", "message_remove", "message_edit", "campaign_view", "campaign_delete", "campaign_edit"}:
+        if len(parts) == 2 and parts[0] in {"targets_page", "target_optin", "target_optout", "target_config", "target_remove", "target_edit", "sticker_remove", "message_view", "message_remove", "message_edit", "campaign_view", "campaign_delete", "campaign_edit"}:
             value = parts[1]
             if parts[0] == "targets_page" and value.isdigit() and int(value) <= 100000:
                 await self._targets_page(query, int(value), edit=True)
@@ -1817,6 +2266,36 @@ class ControlBotService:
                         f"@{target['username']} is marked opted in.",
                         reply_markup=self._dashboard_navigation(None, query.message.chat_id, back_data="dash:section:targets"),
                     )
+            elif parts[0] == "target_optout":
+                target = self._target_by_id(value)
+                if target is None:
+                    await query.edit_message_text("This target is stale or invalid.")
+                else:
+                    self.target_repository.update(value, {
+                        "opted_in": False,
+                        "opted_out_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    await query.edit_message_text(
+                        f"@{target['username']} is opted out and will be excluded from future sends.",
+                        reply_markup=self._dashboard_navigation(None, query.message.chat_id, back_data="dash:section:targets"),
+                    )
+            elif parts[0] == "target_config":
+                target = self._target_by_id(value)
+                admin_id = self.settings.admin_id
+                if (
+                    target is None or query.message.chat.type != "private"
+                    or admin_id is None
+                ):
+                    await query.edit_message_text("Target configuration is unavailable here or the target is stale.")
+                else:
+                    key = (admin_id, query.message.chat_id)
+                    if not self._begin_workflow(
+                        key, "target_content", "settings",
+                        {"target_id": value, **self._target_content_defaults(target)},
+                    ):
+                        await query.edit_message_text("Finish or cancel the active workflow before configuring a target.")
+                    else:
+                        await self._show_target_content_config(query, self._workflows[key], edit=True)
             elif parts[0] in {"target_remove", "sticker_remove", "message_remove", "campaign_delete"}:
                 kind = {"target_remove": "target", "sticker_remove": "sticker", "message_remove": "message", "campaign_delete": "campaign"}[parts[0]]
                 record = self._lookup_action_record(kind, value)
@@ -1877,7 +2356,7 @@ class ControlBotService:
             return
         if len(parts) == 3 and parts[0] == "stickers_page":
             purpose, page_text = parts[1], parts[2]
-            if purpose not in {"view", "remove", "message", "campaign", "test"} or not page_text.isdigit():
+            if purpose not in {"view", "remove", "message", "campaign", "target_content", "test"} or not page_text.isdigit():
                 await query.edit_message_text("Invalid sticker selection.")
             else:
                 await self._stickers_page(query, int(page_text), edit=True, purpose=purpose)
@@ -1941,6 +2420,19 @@ class ControlBotService:
                         InlineKeyboardButton("Cancel", callback_data=f"content_cancel:{nonce}"),
                     ]]), query.message.chat_id)
                     await query.edit_message_text("Campaign preview shown above. Confirm to save and start it.", reply_markup=markup)
+            elif purpose == "target_content":
+                admin_id = self.settings.admin_id
+                if admin_id is None:
+                    await query.edit_message_text("This target configuration expired. Open the target again.")
+                    return
+                key = (admin_id, query.message.chat_id)
+                flow = self._workflows.get(key)
+                if flow is None or flow.kind != "target_content" or flow.step != "settings":
+                    await query.edit_message_text("This target configuration expired. Open the target again.")
+                else:
+                    flow.data["sticker_id"] = sticker_id
+                    flow.data["sticker_enabled"] = True
+                    await self._show_target_content_config(query, flow, edit=True)
             return
         if len(parts) == 2 and parts[0] in {"action_yes", "action_no", "content_save", "content_cancel"}:
             await self._handle_action_confirmation(query, parts[0], parts[1])
@@ -2033,9 +2525,67 @@ class ControlBotService:
             flow = self._workflows.get(key)
             if flow is None or flow.kind != "campaign" or flow.step != "targets" or not flow.data.get("target_ids"):
                 await query.edit_message_text("Select at least one currently opted-in target.")
+            elif any(
+                self._campaign_target_content_config(str(target_id)) is None
+                for target_id in flow.data.get("target_ids", [])
+            ):
+                await query.edit_message_text(
+                    "Configure valid text and/or sticker content for every selected target first. "
+                    "Open Targets, choose each target, then Configure content.",
+                    reply_markup=self._flow_navigation(query.message.chat_id),
+                )
             else:
                 flow.step = "cycles"
                 await query.edit_message_text("Send the number of cycles per selected target (1-100000).", reply_markup=self._flow_navigation(query.message.chat_id))
+            return
+        if len(parts) == 2 and parts[0] == "campaign_mode":
+            key = (self.settings.admin_id, query.message.chat_id)
+            flow = self._workflows.get(key)
+            mode = parts[1]
+            if (flow is None or flow.kind != "campaign" or flow.step != "execution_mode"
+                    or mode not in {"sequential", "parallel"}):
+                await query.edit_message_text("This campaign execution selection is stale.")
+                return
+            target_configs = {}
+            for target_id in flow.data.get("target_ids", []):
+                config = self._campaign_target_content_config(str(target_id))
+                if config is not None:
+                    target_configs[str(target_id)] = config
+            if len(target_configs) != len(flow.data.get("target_ids", [])):
+                await query.edit_message_text(
+                    "A selected target's content is no longer available. Nothing was saved.",
+                    reply_markup=self._flow_navigation(query.message.chat_id),
+                )
+                return
+            flow.data["target_configs"] = target_configs
+            flow.data["execution_mode"] = mode
+            flow.step = "confirm"
+            nonce = secrets.token_urlsafe(6)
+            flow.data["confirmation"] = nonce
+            self._action_confirmations[nonce] = ActionConfirmation(
+                "save_campaign", str(self.settings.admin_id), query.message.chat_id,
+                datetime.now(timezone.utc) + _CONFIRM_TIMEOUT,
+            )
+            target_lines = []
+            for target_id in flow.data["target_ids"]:
+                config = target_configs[str(target_id)]
+                target_lines.append(
+                    self._format_target_content_summary(str(target_id), config)
+                )
+            extra_targets = max(0, len(target_lines) - 12)
+            summary = (
+                f"Campaign summary\nName: {flow.data.get('name', 'Campaign')}\n"
+                f"Execution: {mode}\nAccounts: {len(flow.data.get('account_ids', []))}\n"
+                f"Cycles per target: {flow.data.get('total_cycles', 1)}\nTargets:\n"
+                + "\n".join(target_lines[:12])
+                + (f"\n+ {extra_targets} additional targets" if extra_targets else "")
+                + "\n\nConfirm to save and start this opt-in campaign."
+            )
+            markup = self._with_flow_navigation(InlineKeyboardMarkup([[
+                InlineKeyboardButton("Confirm and start", callback_data=f"content_save:{nonce}"),
+                InlineKeyboardButton("Cancel", callback_data=f"content_cancel:{nonce}"),
+            ]]), query.message.chat_id)
+            await query.edit_message_text(summary, reply_markup=markup)
             return
         if len(parts) == 2 and parts[0] == "campaign_message":
             key = (self.settings.admin_id, query.message.chat_id)
@@ -2059,6 +2609,92 @@ class ControlBotService:
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("Save draft", callback_data=f"content_save:{nonce}"), InlineKeyboardButton("Cancel", callback_data=f"content_cancel:{nonce}")]])
                 markup = self._with_flow_navigation(markup, query.message.chat_id)
                 await query.edit_message_text("Preview shown privately above. Save this campaign draft?", reply_markup=markup)
+            return
+        if len(parts) == 3 and parts[0] == "tconf":
+            action, target_id = parts[1], parts[2]
+            admin_id = self.settings.admin_id
+            if admin_id is None:
+                await query.edit_message_text("This target configuration is stale. Open the target again.")
+                return
+            key = (admin_id, query.message.chat_id)
+            workflow = self._workflows.get(key)
+            target = self._target_by_id(target_id)
+            if (workflow is None or workflow.kind != "target_content"
+                    or str(workflow.data.get("target_id")) != target_id or target is None):
+                await query.edit_message_text("This target configuration is stale. Open the target again.")
+                return
+            if action in {"text", "sticker"}:
+                enabled_key = f"{action}_enabled"
+                if workflow.data.get(enabled_key) is True:
+                    if sum(bool(workflow.data.get(f"{kind}_enabled")) for kind in ("text", "sticker")) <= 1:
+                        await query.edit_message_text("At least one content type must remain enabled.")
+                        return
+                    workflow.data[enabled_key] = False
+                else:
+                    workflow.data[enabled_key] = True
+                    if action == "text" and not workflow.data.get("promotional_text"):
+                        workflow.step = "text"
+                        await query.edit_message_text(
+                            "Send the promotional text (1-4096 characters).",
+                            reply_markup=self._flow_navigation(query.message.chat_id),
+                        )
+                        return
+                    if action == "sticker" and not self._get_sticker(workflow.data.get("sticker_id")):
+                        await self._stickers_page(query, 0, edit=True, purpose="target_content")
+                        return
+                await self._show_target_content_config(query, workflow, edit=True)
+            elif action == "settext" and workflow.data.get("text_enabled") is True:
+                workflow.step = "text"
+                await query.edit_message_text(
+                    "Send the promotional text (1-4096 characters).",
+                    reply_markup=self._flow_navigation(query.message.chat_id),
+                )
+            elif action == "setsticker" and workflow.data.get("sticker_enabled") is True:
+                await self._stickers_page(query, 0, edit=True, purpose="target_content")
+            elif action == "save":
+                config = self._validated_target_content_config(target, workflow.data)
+                if config is None:
+                    await query.edit_message_text(
+                        "Choose at least one enabled content type and provide its text or sticker.",
+                        reply_markup=self._flow_navigation(query.message.chat_id),
+                    )
+                    return
+                try:
+                    if workflow.data.get("scope") == "campaign":
+                        campaign_id = str(workflow.data.get("campaign_id", ""))
+                        campaign = self._get_campaign(campaign_id)
+                        configs = self._campaign_content_configs(campaign) if campaign else None
+                        if campaign is None or campaign.get("status") == "running" or configs is None:
+                            await query.edit_message_text("Campaign changed or is running; target settings were not saved.")
+                            return
+                        configs[target_id] = config
+                        self.campaign_repository.update(campaign_id, {
+                            "target_configs": configs,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                    else:
+                        self.target_repository.update(target_id, {
+                            "promotion_config": config,
+                            "promotion_config_updated_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                except JsonStoreError as exc:
+                    logger.error("Could not save target content configuration (error=%s)", type(exc).__name__)
+                    await query.edit_message_text(
+                        "Target settings could not be saved. Existing settings remain active.",
+                        reply_markup=self._flow_navigation(query.message.chat_id),
+                    )
+                    return
+                self._workflows.pop(key, None)
+                if workflow.data.get("scope") == "campaign":
+                    updated_campaign = self._get_campaign(str(workflow.data["campaign_id"]))
+                    if updated_campaign is None:
+                        await query.edit_message_text("Target settings were saved, but the campaign is unavailable.")
+                    else:
+                        await self._show_campaign(query, updated_campaign, edit=True)
+                else:
+                    await self._show_target(query, self._target_by_id(target_id) or target, edit=True)
+            else:
+                await query.edit_message_text("This target configuration action is unavailable.")
             return
         if len(parts) == 3 and parts[0] == "target_view":
             target_id, page_text = parts[1], parts[2]
@@ -2472,6 +3108,19 @@ class ControlBotService:
                 ]]),
             )
             return
+        if workflow.kind == "target_content" and workflow.step == "text":
+            promotional_text = text.strip()
+            if not promotional_text or len(promotional_text) > _TEXT_LIMIT:
+                await message.reply_text(
+                    "Promotional text must contain 1-4096 characters.",
+                    reply_markup=self._flow_navigation(message.chat_id),
+                )
+                return
+            workflow.data["promotional_text"] = promotional_text
+            workflow.data["text_enabled"] = True
+            workflow.step = "settings"
+            await self._show_target_content_config(message, workflow)
+            return
         if workflow.kind == "promotion_config" and workflow.step == "name":
             if not text or len(text) > 80:
                 await message.reply_text("Enter a promotion name between 1 and 80 characters, or cancel.",
@@ -2535,8 +3184,14 @@ class ControlBotService:
                 await message.reply_text("Enter a whole number of cycles from 1 to 100000, or /cancel.", reply_markup=self._flow_navigation(message.chat_id))
                 return
             workflow.data["total_cycles"] = cycles
-            workflow.step = "sticker"
-            await self._stickers_page(message, 0, purpose="campaign")
+            workflow.step = "execution_mode"
+            await message.reply_text(
+                "Choose how selected targets should be processed:",
+                reply_markup=self._with_flow_navigation(InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Sequential", callback_data="campaign_mode:sequential"),
+                    InlineKeyboardButton("Parallel", callback_data="campaign_mode:parallel"),
+                ]]), message.chat_id),
+            )
             return
         if workflow.kind == "add_target" and workflow.step == "username":
             username = text.removeprefix("@").strip()
@@ -2744,13 +3399,26 @@ class ControlBotService:
             await self._targets_page(message, 0)
 
     async def _show_target(self, message_or_query, target: dict, edit: bool = False) -> None:
-        text = f"Target: @{target['username']}\nOpted in: {'Yes' if target.get('opted_in') is True else 'No'}\nID: {target['id']}"
+        config = target.get("promotion_config") or {}
+        content_status = (
+            f"\nContent: text {'on' if config.get('text_enabled') else 'off'}, "
+            f"sticker {'on' if config.get('sticker_enabled') else 'off'}"
+            if isinstance(config, dict) and config else "\nContent: not configured"
+        )
+        text = (
+            f"Target: @{target['username']}\n"
+            f"Opted in: {'Yes' if target.get('opted_in') is True else 'No'}"
+            f"{content_status}\nID: {target['id']}"
+        )
         buttons = [
+            [InlineKeyboardButton("Configure content", callback_data=f"target_config:{target['id']}")],
             [InlineKeyboardButton("Edit username", callback_data=f"target_edit:{target['id']}")],
             [InlineKeyboardButton("Remove target", callback_data=f"target_remove:{target['id']}")],
         ]
         if target.get("opted_in") is not True:
             buttons.insert(0, [InlineKeyboardButton("Confirm explicit opt-in", callback_data=f"target_optin:{target['id']}")])
+        else:
+            buttons.insert(0, [InlineKeyboardButton("Record opt-out", callback_data=f"target_optout:{target['id']}")])
         buttons.append([InlineKeyboardButton("Back to targets", callback_data="targets_page:0")])
         buttons.append([InlineKeyboardButton("Home", callback_data="dash:home")])
         markup = InlineKeyboardMarkup(buttons)
@@ -2758,6 +3426,83 @@ class ControlBotService:
             await message_or_query.edit_message_text(text, reply_markup=markup)
         else:
             await message_or_query.reply_text(text, reply_markup=markup)
+
+    @staticmethod
+    def _target_content_defaults(target: dict) -> dict:
+        saved = target.get("promotion_config")
+        if not isinstance(saved, dict):
+            saved = {}
+        return {
+            "text_enabled": saved.get("text_enabled") is True,
+            "promotional_text": str(saved.get("promotional_text") or ""),
+            "sticker_enabled": saved.get("sticker_enabled") is True,
+            "sticker_id": str(saved.get("sticker_id") or ""),
+        }
+
+    def _validated_target_content_config(self, target: dict, values: dict) -> dict | None:
+        text_enabled = values.get("text_enabled") is True
+        sticker_enabled = values.get("sticker_enabled") is True
+        if not text_enabled and not sticker_enabled:
+            return None
+        promotional_text = str(values.get("promotional_text") or "").strip()
+        if text_enabled and (not promotional_text or len(promotional_text) > _TEXT_LIMIT):
+            return None
+        sticker_id = str(values.get("sticker_id") or "")
+        if sticker_enabled and self._get_sticker(sticker_id) is None:
+            return None
+        return {
+            "target_id": str(target["id"]),
+            "target_username": str(target["username"]),
+            "target_display_name": f"@{target['username']}",
+            "text_enabled": text_enabled,
+            "promotional_text": promotional_text if text_enabled else None,
+            "sticker_enabled": sticker_enabled,
+            "sticker_id": sticker_id if sticker_enabled else None,
+        }
+
+    async def _show_target_content_config(self, message_or_query, workflow: Workflow, edit: bool = False) -> None:
+        target = self._target_by_id(str(workflow.data.get("target_id", "")))
+        if target is None:
+            await message_or_query.edit_message_text("This target is no longer available.")
+            return
+        text_enabled = workflow.data.get("text_enabled") is True
+        sticker_enabled = workflow.data.get("sticker_enabled") is True
+        text_value = str(workflow.data.get("promotional_text") or "")
+        sticker = self._get_sticker(str(workflow.data.get("sticker_id") or ""))
+        text_summary = (
+            text_value[:150] + ("..." if len(text_value) > 150 else "")
+            if text_enabled and text_value else "not set"
+        )
+        sticker_summary = self._sticker_name(sticker) if sticker_enabled and sticker else "not set"
+        rows = [
+            [InlineKeyboardButton(
+                f"Text: {'Enabled' if text_enabled else 'Disabled'}",
+                callback_data=f"tconf:text:{target['id']}",
+            )],
+            [InlineKeyboardButton(
+                f"Sticker: {'Enabled' if sticker_enabled else 'Disabled'}",
+                callback_data=f"tconf:sticker:{target['id']}",
+            )],
+        ]
+        if text_enabled:
+            rows.append([InlineKeyboardButton("Set promotional text", callback_data=f"tconf:settext:{target['id']}")])
+        if sticker_enabled:
+            rows.append([InlineKeyboardButton("Select sticker", callback_data=f"tconf:setsticker:{target['id']}")])
+        rows.extend([
+            [InlineKeyboardButton("Save target settings", callback_data=f"tconf:save:{target['id']}")],
+            [InlineKeyboardButton("Cancel", callback_data="dash:cancel:back")],
+        ])
+        markup = self._with_flow_navigation(InlineKeyboardMarkup(rows), self._chat_id(message_or_query))
+        prompt = (
+            f"Content settings for @{target['username']}\n"
+            f"Text: {'Enabled' if text_enabled else 'Disabled'} — {text_summary}\n"
+            f"Sticker: {'Enabled' if sticker_enabled else 'Disabled'} — {sticker_summary}\n\n"
+            "At least one content type must be enabled."
+        )
+        if edit:
+            await message_or_query.edit_message_text(prompt, reply_markup=markup)
+        else:
+            await message_or_query.reply_text(prompt, reply_markup=markup)
 
     async def _remove_target_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_message is not None:
@@ -2862,11 +3607,11 @@ class ControlBotService:
             if page + 1 < pages:
                 row.append(InlineKeyboardButton("Next", callback_data=f"stickers_page:{purpose}:{page + 1}"))
             rows.append(row)
-        if purpose in {"message", "campaign", "test"}:
+        if purpose in {"message", "campaign", "target_content", "test"}:
             markup = self._with_flow_navigation(InlineKeyboardMarkup(rows) if rows else None, self._chat_id(message_or_query))
         else:
             markup = self._dashboard_navigation(InlineKeyboardMarkup(rows) if rows else None, self._chat_id(message_or_query))
-        text = "Select a sticker:" if purpose in {"message", "campaign", "test"} else f"Stickers: {len(stickers)}"
+        text = "Select a sticker:" if purpose in {"message", "campaign", "target_content", "test"} else f"Stickers: {len(stickers)}"
         if edit:
             await message_or_query.edit_message_text(text if rows else "No usable stickers are saved.", reply_markup=markup)
         else:
@@ -3067,9 +3812,6 @@ class ControlBotService:
         if not self._targets(opted_in_only=True):
             await message.reply_text("No explicitly opted-in targets are saved. Campaign drafts cannot select other targets.")
             return
-        if not self.sticker_repository.list():
-            await message.reply_text("Save at least one named sticker first.")
-            return
         if not self._begin_workflow(key, "campaign", "name", {"target_ids": []}):
             await message.reply_text("Finish or cancel the active account authentication before starting another workflow.")
             return
@@ -3180,6 +3922,90 @@ class ControlBotService:
                 else "No normal campaigns are suspended by scheduled priority.")
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
+    def _campaign_target_content_config(
+        self, target_id: str, saved: dict | None = None, legacy_sticker_id: str | None = None,
+    ) -> dict | None:
+        target = self._target_by_id(str(target_id))
+        if target is None or target.get("opted_in") is not True:
+            return None
+        if saved is None and legacy_sticker_id:
+            saved = {
+                "target_id": str(target_id),
+                "text_enabled": True,
+                "promotional_text": None,
+                "legacy_rotating_text": True,
+                "sticker_enabled": True,
+                "sticker_id": legacy_sticker_id,
+            }
+        elif saved is None:
+            saved = target.get("promotion_config")
+        if not isinstance(saved, dict) or (
+            saved.get("target_id") is not None and str(saved.get("target_id")) != str(target_id)
+        ):
+            return None
+        text_enabled = saved.get("text_enabled") is True
+        sticker_enabled = saved.get("sticker_enabled") is True
+        if not text_enabled and not sticker_enabled:
+            return None
+        text = saved.get("promotional_text")
+        legacy_rotating_text = saved.get("legacy_rotating_text") is True
+        if text_enabled and not legacy_rotating_text and (
+            not isinstance(text, str) or not text.strip() or len(text.strip()) > _TEXT_LIMIT
+        ):
+            return None
+        sticker_id = saved.get("sticker_id")
+        if sticker_enabled and self._get_sticker(str(sticker_id or "")) is None:
+            return None
+        return {
+            "target_id": str(target_id),
+            "target_username": str(target["username"]),
+            "target_display_name": f"@{target['username']}",
+            "text_enabled": text_enabled,
+            "promotional_text": text.strip() if text_enabled and isinstance(text, str) else None,
+            "legacy_rotating_text": legacy_rotating_text,
+            "sticker_enabled": sticker_enabled,
+            "sticker_id": str(sticker_id) if sticker_enabled else None,
+        }
+
+    def _campaign_content_configs(self, campaign: dict) -> dict[str, dict] | None:
+        target_ids = campaign.get("target_ids")
+        saved_configs = campaign.get("target_configs")
+        if not isinstance(target_ids, list) or not target_ids:
+            return None
+        configs: dict[str, dict] = {}
+        for raw_id in target_ids:
+            target_id = str(raw_id)
+            saved = saved_configs.get(target_id) if isinstance(saved_configs, dict) else None
+            config = self._campaign_target_content_config(
+                target_id, saved,
+                str(campaign.get("sticker_id")) if not isinstance(saved_configs, dict) else None,
+            )
+            if config is None:
+                return None
+            configs[target_id] = config
+        if isinstance(saved_configs, dict) and set(saved_configs) != set(configs):
+            return None
+        return configs
+
+    def _format_target_content_summary(
+        self, target_id: str, config: dict, rotation_index: int = 0,
+    ) -> str:
+        target = self._target_by_id(str(target_id)) or {}
+        target_name = str(config.get("target_display_name") or f"@{target.get('username', 'unknown')}")
+        if not config.get("text_enabled"):
+            text_summary = "text off"
+        elif config.get("legacy_rotating_text"):
+            sample = PROMOTION_MESSAGES[rotation_index % len(PROMOTION_MESSAGES)]
+            text_summary = f"rotating text ({sample[:45]})"
+        else:
+            text_summary = f"text '{str(config.get('promotional_text') or '')[:60]}'"
+        if config.get("sticker_enabled"):
+            sticker = self._get_sticker(str(config.get("sticker_id") or ""))
+            sticker_summary = f"sticker {self._sticker_name(sticker or {})}"
+        else:
+            sticker_summary = "sticker off"
+        return f"{target_name}: {text_summary}; {sticker_summary}"
+
     def _get_campaign(self, campaign_id: str) -> dict | None:
         if not _RECORD_ID_PATTERN.fullmatch(campaign_id):
             return None
@@ -3197,8 +4023,7 @@ class ControlBotService:
         targets = [self._target_by_id(str(target_id)) for target_id in target_ids]
         if any(target is None or target.get("opted_in") is not True for target in targets):
             return None
-        sticker = self._get_sticker(str(campaign.get("sticker_id", "")))
-        if sticker is None:
+        if self._campaign_content_configs(campaign) is None:
             return None
         try:
             cycles = max(1, min(100000, int(campaign.get("total_cycles", 1))))
@@ -3216,6 +4041,17 @@ class ControlBotService:
             "scheduling_enabled": campaign.get("scheduling_enabled") is True,
             "progress": progress,
         }
+        execution_mode = campaign.get("execution_mode", "sequential")
+        if execution_mode not in {"sequential", "parallel"}:
+            return None
+        try:
+            concurrency_limit = int(campaign.get("concurrency_limit", 3))
+        except (ValueError, TypeError):
+            return None
+        if not 1 <= concurrency_limit <= 5:
+            return None
+        changes["execution_mode"] = execution_mode
+        changes["concurrency_limit"] = concurrency_limit
         if any(campaign.get(key) != value for key, value in changes.items()):
             campaign = self.campaign_repository.update(campaign_id, changes)
         return campaign
@@ -3237,6 +4073,10 @@ class ControlBotService:
         account_names = [str(account.get("name") or account.get("phone", "unavailable")) for account in accounts if account]
         targets = [self._target_by_id(str(target_id)) for target_id in campaign["target_ids"]]
         target_names = [f"@{target['username']}" for target in targets if target]
+        target_names_summary = ", ".join(target_names[:8])
+        if len(target_names) > 8:
+            target_names_summary += f", +{len(target_names) - 8} more"
+        content_configs = self._campaign_content_configs(campaign) or {}
         progress = campaign.get("progress") or {}
         total = max(0, int(progress.get("total", 0)))
         completed = max(0, int(progress.get("completed", 0)))
@@ -3244,11 +4084,18 @@ class ControlBotService:
         if self.campaign_execution is not None:
             restricted = sum(
                 int(task.get("restricted", 0))
-                for task in self.campaign_execution.task_records(str(campaign["id"]))
+                for task in await asyncio.to_thread(
+                    self.campaign_execution.task_records, str(campaign["id"]),
+                )
             )
         percent = min(100, int(completed * 100 / total)) if total else 0
         bar = "#" * (percent // 5) + "-" * (20 - percent // 5)
         rotation = int(campaign.get("rotation_index", 0)) % len(PROMOTION_MESSAGES)
+        content_lines = [
+            self._format_target_content_summary(target_id, config, rotation)
+            for target_id, config in content_configs.items()
+        ]
+        additional_content_targets = max(0, len(content_lines) - 8)
         suspended_lines = []
         suspended_buttons = []
         if self.campaign_execution is not None:
@@ -3277,10 +4124,12 @@ class ControlBotService:
         text = (
             f"Campaign: {campaign['name']}\nStatus: {campaign.get('status', 'draft')}\n"
             f"Accounts ({len(account_names)}): {', '.join(account_names)}\n"
-            f"Targets ({len(target_names)}): {', '.join(target_names)}\n"
+            f"Targets ({len(target_names)}): {target_names_summary}\n"
+            f"Execution: {campaign.get('execution_mode', 'sequential')}\n"
             f"Cycles per target: {campaign.get('total_cycles', 1)}\n"
-            f"Sticker: {self._sticker_name(self._get_sticker(campaign.get('sticker_id')) or {})}\n"
-            f"Next built-in text: {PROMOTION_MESSAGES[rotation]}\n"
+            + "\n".join(content_lines[:8])
+            + (f"\n+ {additional_content_targets} additional targets" if additional_content_targets else "")
+            + "\n"
             f"Progress: {completed}/{total} | {percent}%\n{bar}\n"
             f"Successful cycles: {int(progress.get('successful', 0))} | Failed cycles: {int(progress.get('failed', 0))} | Restricted cycles: {restricted}\n"
             f"Current operation: {campaign.get('current_operation', 'idle')}"
@@ -3293,6 +4142,7 @@ class ControlBotService:
             [InlineKeyboardButton("Stop", callback_data=f"campaign_control:stop:{campaign['id']}")],
             [InlineKeyboardButton("Per-account / target progress", callback_data=f"campaign_progress:{campaign['id']}:0")],
             [InlineKeyboardButton("Set cycles per target", callback_data=f"campaign_config:cycles:{campaign['id']}")],
+            [InlineKeyboardButton("Edit target content", callback_data=f"campaign_content:{campaign['id']}")],
         ] + suspended_buttons + [
             [InlineKeyboardButton(
                 "Disable scheduling" if campaign.get("scheduling_enabled") else "Enable scheduling",
@@ -3393,6 +4243,9 @@ class ControlBotService:
                 reply_markup=InlineKeyboardMarkup(rows),
             )
             self._campaign_last_edit[campaign["id"]] = now
+            if len(self._campaign_last_edit) > 512:
+                oldest = min(self._campaign_last_edit, key=self._campaign_last_edit.get)
+                self._campaign_last_edit.pop(oldest, None)
         except Exception as exc:
             logger.debug("Campaign progress message edit skipped (error=%s)", type(exc).__name__)
     async def _delete_campaign_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3430,19 +4283,80 @@ class ControlBotService:
         else:
             await message_or_query.reply_text(text if eligible else "No opted-in targets remain.", reply_markup=markup)
 
+    async def _show_campaign_content_targets(
+        self, message_or_query, campaign: dict, page: int = 0, edit: bool = False,
+    ) -> None:
+        targets = [
+            self._target_by_id(str(target_id)) for target_id in campaign.get("target_ids", [])
+        ]
+        targets = [target for target in targets if target is not None]
+        pages = max(1, (len(targets) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+        page = min(max(int(page), 0), pages - 1)
+        start = page * _PAGE_SIZE
+        rows = [[InlineKeyboardButton(
+            f"@{target['username']}"[:60],
+            callback_data=f"campaign_content_target:{campaign['id']}:{index}",
+        )] for index, target in enumerate(targets[start:start + _PAGE_SIZE], start=start)]
+        if pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton(
+                    "Previous", callback_data=f"campaign_content_page:{campaign['id']}:{page - 1}",
+                ))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+            if page + 1 < pages:
+                nav.append(InlineKeyboardButton(
+                    "Next", callback_data=f"campaign_content_page:{campaign['id']}:{page + 1}",
+                ))
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("Campaign", callback_data=f"campaign_view:{campaign['id']}")])
+        markup = self._dashboard_navigation(
+            InlineKeyboardMarkup(rows), self._chat_id(message_or_query),
+            back_data=f"campaign_view:{campaign['id']}",
+        )
+        text = "Choose one target to edit its saved content only:"
+        if edit:
+            await message_or_query.edit_message_text(text, reply_markup=markup)
+        else:
+            await message_or_query.reply_text(text, reply_markup=markup)
+
     def _lookup_action_record(self, kind: str, record_id: str) -> dict | None:
         if not _RECORD_ID_PATTERN.fullmatch(record_id):
             return None
         if kind == "target":
             item = self._target_by_id(record_id)
-            if item is not None and any(record_id in campaign.get("target_ids", []) for campaign in self.campaign_repository.list()):
+            scheduled_target_ids = (
+                (self.scheduler_service.execution_service.scheduled_promotion_model() or {}).get("target_ids", [])
+                if self.scheduler_service is not None else []
+            )
+            if item is not None and (
+                any(record_id in campaign.get("target_ids", []) for campaign in self.campaign_repository.list())
+                or record_id in scheduled_target_ids
+            ):
                 return None
             return item
         if kind == "sticker":
             item = self._get_sticker(record_id)
+            scheduled_model = (
+                self.scheduler_service.execution_service.scheduled_promotion_model() or {}
+                if self.scheduler_service is not None else {}
+            )
             if item is not None and (
                 any(record.get("sticker_id") == record_id for record in self.message_repository.list())
                 or any(record.get("sticker_id") == record_id for record in self.campaign_repository.list())
+                or any(
+                    (target.get("promotion_config") or {}).get("sticker_id") == record_id
+                    for target in self.target_repository.list()
+                )
+                or any(
+                    (record.get("target_configs") or {}).get(str(target_id), {}).get("sticker_id") == record_id
+                    for record in self.campaign_repository.list()
+                    for target_id in record.get("target_ids", [])
+                )
+                or any(
+                    (scheduled_model.get("target_configs") or {}).get(str(target_id), {}).get("sticker_id") == record_id
+                    for target_id in scheduled_model.get("target_ids", [])
+                )
             ):
                 return None
             return item
@@ -3473,11 +4387,15 @@ class ControlBotService:
     async def _handle_action_confirmation(self, query, action: str, nonce: str) -> None:
         confirmation = self._action_confirmations.pop(nonce, None)
         chat_id = query.message.chat_id if query.message is not None else 0
+        admin_id = self.settings.admin_id
         if confirmation is None or confirmation.chat_id != chat_id or confirmation.expires_at <= datetime.now(timezone.utc):
             await query.edit_message_text("This confirmation expired or is no longer valid. Start the command again.")
             return
         if action == "action_no" or action == "content_cancel":
-            key = (self.settings.admin_id, chat_id)
+            if admin_id is None:
+                await query.edit_message_text("Owner configuration is unavailable.")
+                return
+            key = (admin_id, chat_id)
             workflow = self._workflows.get(key)
             if workflow is not None and workflow.data.get("confirmation") == nonce:
                 self._workflows.pop(key, None)
@@ -3508,7 +4426,10 @@ class ControlBotService:
             await self._show_restrictions(query)
             return
         if action == "content_save":
-            key = (self.settings.admin_id, chat_id)
+            if admin_id is None:
+                await query.edit_message_text("Owner configuration is unavailable.")
+                return
+            key = (admin_id, chat_id)
             workflow = self._workflows.get(key)
             if workflow is None or workflow.data.get("confirmation") != nonce:
                 await query.edit_message_text("This save confirmation is stale. Start the workflow again.")
@@ -3555,11 +4476,24 @@ class ControlBotService:
                 account_ids = list(dict.fromkeys(str(item) for item in workflow.data.get("account_ids", [])))
                 accounts = [self._get_account(account_id) for account_id in account_ids]
                 targets = [self._target_by_id(str(target_id)) for target_id in workflow.data.get("target_ids", [])]
-                sticker = self._get_sticker(workflow.data.get("sticker_id"))
+                submitted_configs = workflow.data.get("target_configs")
+                target_configs = {}
+                if isinstance(submitted_configs, dict):
+                    for target in targets:
+                        if target is None:
+                            continue
+                        target_id = str(target["id"])
+                        config = self._campaign_target_content_config(
+                            target_id, submitted_configs.get(target_id),
+                        )
+                        if config is not None:
+                            target_configs[target_id] = config
                 cycles = int(workflow.data.get("total_cycles", 0))
                 if (not accounts or any(item is None for item in accounts) or not targets
                         or any(item is None or item.get("opted_in") is not True for item in targets)
-                        or sticker is None or cycles < 1 or cycles > 100000):
+                        or len(target_configs) != len(targets)
+                        or workflow.data.get("execution_mode") not in {"sequential", "parallel"}
+                        or cycles < 1 or cycles > 100000):
                     await query.edit_message_text("Campaign selections changed or are unavailable. Nothing was saved or started.")
                 else:
                     record_id = uuid.uuid4().hex
@@ -3569,7 +4503,9 @@ class ControlBotService:
                         "name": workflow.data["name"],
                         "account_ids": account_ids,
                         "target_ids": [item["id"] for item in targets],
-                        "sticker_id": sticker["id"],
+                        "target_configs": target_configs,
+                        "execution_mode": workflow.data["execution_mode"],
+                        "concurrency_limit": 3,
                         "total_cycles": cycles,
                         "rotation_index": 0,
                         "scheduling_enabled": False,

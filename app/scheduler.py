@@ -36,6 +36,7 @@ class SchedulerSettings:
     outside_peak_concurrency_21_50: int = 2
     outside_peak_concurrency_51_plus: int = 3
     peak_concurrency: int = 5
+    parallel_target_concurrency: int = 3
     progress_report_time: str = "21:00"
     final_report_time: str = "03:15"
 
@@ -182,42 +183,120 @@ class SchedulerService:
 
     def _ensure_scheduled_promotion_model(self) -> dict | None:
         promotion = self.promotion_config()
-        target_id = str(promotion.get("target_id", ""))
-        target = self.execution_service.targets.get(target_id) or {}
-        if not target_id or target.get("opted_in") is not True or not target.get("username"):
+        target_ids = promotion.get("target_ids") or (
+            [promotion.get("target_id")] if promotion.get("target_id") else []
+        )
+        target_ids = list(dict.fromkeys(str(item) for item in target_ids if item))
+        if not target_ids:
             return None
         config = self.repository.get_config()
         model = dict(config.get("scheduled_execution") or {})
         stickers = sorted(self.execution_service.stickers.list(), key=lambda item: str(item.get("id", "")))
-        sticker_id = model.get("sticker_id")
-        if not self.execution_service.scheduled_sticker_available(sticker_id):
-            sticker_id = next((str(item["id"]) for item in stickers
-                               if self.execution_service.scheduled_sticker_available(str(item.get("id", "")))), None)
+        default_sticker_id = model.get("sticker_id")
+        if not self.execution_service.scheduled_sticker_available(default_sticker_id):
+            default_sticker_id = next((
+                str(item["id"]) for item in stickers
+                if self.execution_service.scheduled_sticker_available(str(item.get("id", "")))
+            ), None)
+        saved_configs = promotion.get("target_configs")
+        target_configs = {}
+        for target_id in target_ids:
+            target = self.execution_service.targets.get(target_id) or {}
+            if target.get("opted_in") is not True or not target.get("username"):
+                return None
+            saved = saved_configs.get(target_id) if isinstance(saved_configs, dict) else None
+            if saved is None and isinstance(saved_configs, dict):
+                return None
+            if saved is None and default_sticker_id:
+                saved = {
+                    "target_id": target_id, "text_enabled": True,
+                    "promotional_text": None, "legacy_rotating_text": True,
+                    "sticker_enabled": True, "sticker_id": default_sticker_id,
+                }
+            if saved is None:
+                saved = target.get("promotion_config")
+            if not isinstance(saved, dict):
+                return None
+            validated = self.execution_service._target_content_config(
+                {"target_configs": {target_id: saved}}, target_id,
+            )
+            if validated is None:
+                return None
+            target_configs[target_id] = validated
+        if isinstance(saved_configs, dict) and set(saved_configs) != set(target_ids):
+            return None
+        first_target_id = target_ids[0]
+        first_config = target_configs[first_target_id]
+        execution_mode = promotion.get("execution_mode", "sequential")
+        if execution_mode not in {"sequential", "parallel"}:
+            return None
         model.update({
             "id": SCHEDULED_PROMOTION_ID, "name": str(promotion.get("name") or "Promotion"),
-            "target_ids": [target_id], "target_id": target_id,
+            "target_ids": target_ids, "target_id": first_target_id,
+            "target_configs": target_configs,
+            "execution_mode": execution_mode,
+            "concurrency_limit": self._settings.parallel_target_concurrency,
             "account_ids": sorted(str(item["id"]) for item in self.account_repository.list()
                                    if item.get("id")),
-            "sticker_id": sticker_id, "total_cycles": 1,
+            "sticker_id": first_config.get("sticker_id"), "total_cycles": 1,
         })
         config["scheduled_execution"] = model
         self.repository.save_config(config)
         return model
 
-    async def save_promotion_config(self, name: str, target_id: str) -> dict:
-        name, target_id = str(name).strip(), str(target_id)
+    async def save_promotion_config(
+        self, name: str, target_ids: str | list[str], execution_mode: str = "sequential",
+    ) -> dict:
+        name = str(name).strip()
         if not name or len(name) > 80:
             raise ValueError("Promotion name must be between 1 and 80 characters")
-        target = self.execution_service.targets.get(target_id)
-        if target is None or target.get("opted_in") is not True or not target.get("username"):
-            raise ValueError("Select an existing target with confirmed opt-in")
+        selected_ids = [str(target_ids)] if isinstance(target_ids, str) else [
+            str(item) for item in target_ids
+        ]
+        selected_ids = list(dict.fromkeys(selected_ids))
+        if not selected_ids:
+            raise ValueError("Select at least one existing target with confirmed opt-in")
+        if execution_mode not in {"sequential", "parallel"}:
+            raise ValueError("Choose sequential or parallel target execution")
+        previous = self.promotion_config()
+        previous_ids = previous.get("target_ids") or (
+            [previous.get("target_id")] if previous.get("target_id") else []
+        )
+        legacy_model = self.execution_service.scheduled_promotion_model() or {}
+        target_configs = {}
+        target_usernames = {}
+        for target_id in selected_ids:
+            target = self.execution_service.targets.get(target_id)
+            if target is None or target.get("opted_in") is not True or not target.get("username"):
+                raise ValueError("Every selected target must have confirmed opt-in")
+            saved = target.get("promotion_config")
+            if (
+                not isinstance(saved, dict) and len(selected_ids) == 1
+                and [str(item) for item in previous_ids] == [target_id]
+                and self.execution_service.scheduled_sticker_available(legacy_model.get("sticker_id"))
+            ):
+                saved = {
+                    "target_id": target_id, "text_enabled": True,
+                    "promotional_text": None, "legacy_rotating_text": True,
+                    "sticker_enabled": True, "sticker_id": legacy_model["sticker_id"],
+                }
+            validated = self.execution_service._target_content_config(
+                {"target_configs": {target_id: saved}}, target_id,
+            ) if isinstance(saved, dict) else None
+            if validated is None:
+                raise ValueError(f"Configure valid text and/or sticker content for @{target['username']} first")
+            target_configs[target_id] = validated
+            target_usernames[target_id] = str(target["username"])
         value = {
-            "name": name, "target_id": target_id,
-            "target_username": str(target["username"]),
+            "name": name, "target_id": selected_ids[0],
+            "target_ids": selected_ids, "target_usernames": target_usernames,
+            "target_configs": target_configs, "execution_mode": execution_mode,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        previous = self.promotion_config()
-        must_reconcile = previous.get("target_id") != target_id and any(
+        must_reconcile = (
+            [str(item) for item in previous_ids] != selected_ids
+            or previous.get("execution_mode", "sequential") != execution_mode
+        ) and any(
             not task.done() for _, task in self._workers.values()
         )
         was_paused = self._manually_paused
@@ -231,7 +310,7 @@ class SchedulerService:
         config["promotion"] = value
         self.repository.save_config(config)
         self._ensure_scheduled_promotion_model()
-        if not previous.get("target_id") and not self._recovery_confirmation_required:
+        if not previous_ids and not self._recovery_confirmation_required:
             self._enabled = False
             self._manually_paused = False
             self._state = SchedulerState.DISABLED
@@ -247,15 +326,15 @@ class SchedulerService:
         return value
 
     async def start_promotion(self) -> dict:
-        if not self.promotion_config().get("target_id"):
+        if not (self.promotion_config().get("target_ids") or self.promotion_config().get("target_id")):
             raise ValueError("Promotion not configured")
         if self._recovery_confirmation_required:
             raise ValueError("Confirm scheduler recovery before starting promotion")
         if not self._schedulable_campaigns():
             raise ValueError("The configured target or scheduled promotion content is unavailable.")
         promotion_model = self.execution_service.scheduled_promotion_model() or {}
-        if not self.execution_service.scheduled_sticker_available(promotion_model.get("sticker_id")):
-            raise ValueError("Upload a sticker in the existing Sticker Library before starting promotion.")
+        if promotion_model is None or not isinstance(promotion_model.get("target_configs"), dict):
+            raise ValueError("Configure valid promotional text and/or a sticker for every opted-in target.")
         self._manually_paused = False
         self._enabled = True
         self._state = SchedulerState.WAITING
@@ -275,15 +354,15 @@ class SchedulerService:
         return self.status()
 
     async def resume_promotion(self) -> dict:
-        if not self.promotion_config().get("target_id"):
+        if not (self.promotion_config().get("target_ids") or self.promotion_config().get("target_id")):
             raise ValueError("Promotion not configured")
         if self._recovery_confirmation_required:
             raise ValueError("Confirm scheduler recovery before resuming promotion")
         if not self._schedulable_campaigns():
             raise ValueError("The configured target or scheduled promotion content is unavailable.")
         promotion_model = self.execution_service.scheduled_promotion_model() or {}
-        if not self.execution_service.scheduled_sticker_available(promotion_model.get("sticker_id")):
-            raise ValueError("Upload a sticker in the existing Sticker Library before resuming promotion.")
+        if promotion_model is None or not isinstance(promotion_model.get("target_configs"), dict):
+            raise ValueError("Configure valid promotional text and/or a sticker for every opted-in target.")
         self._manually_paused = False
         self._enabled = True
         self._state = SchedulerState.WAITING
@@ -295,10 +374,13 @@ class SchedulerService:
     async def promotion_dashboard_data(self, page: int = 0, page_size: int = 5) -> dict:
         """Return dashboard values backed by current services and persisted records."""
         config = self.promotion_config()
-        if not config.get("target_id"):
+        target_ids = config.get("target_ids") or (
+            [config.get("target_id")] if config.get("target_id") else []
+        )
+        target_ids = [str(item) for item in target_ids if item]
+        if not target_ids:
             return {"configured": False, "status": self.status()}
-        target_id = str(config["target_id"])
-        target = self.execution_service.targets.get(target_id) or {}
+        targets = [self.execution_service.targets.get(target_id) or {} for target_id in target_ids]
         campaigns = self._schedulable_campaigns()
         campaign_ids = {str(item["id"]) for item in campaigns}
         account_ids = sorted(
@@ -329,7 +411,7 @@ class SchedulerService:
         for item in all_events:
             if str(item.get("campaign_id", "")) not in scheduled_campaign_ids:
                 continue
-            if item.get("target_id") is not None and str(item.get("target_id")) != target_id:
+            if item.get("target_id") is not None and str(item.get("target_id")) not in set(target_ids):
                 continue
             try:
                 occurred = datetime.fromisoformat(str(item["occurred_at"]))
@@ -379,7 +461,7 @@ class SchedulerService:
                 rate_limited_until[account_id] = until
 
         restricted_pairs = self._restricted_pairs([{
-            "account_ids": account_ids, "target_ids": [target_id],
+            "account_ids": account_ids, "target_ids": target_ids,
         }])
         restricted_by_account = {str(item["account_id"]): item for item in restricted_pairs}
         current = self.status()
@@ -430,13 +512,16 @@ class SchedulerService:
             for state in ("Running", "Waiting", "Paused", "Restricted", "Rate Limited", "Unavailable")
         }
         return {
-            "configured": True, "promotion": config, "target_username": target.get("username"),
+            "configured": True, "promotion": config,
+            "target_username": ", @".join(
+                str(target.get("username", "unavailable")).lstrip("@") for target in targets
+            ),
+            "target_usernames": [str(target.get("username", "unavailable")) for target in targets],
             "status": current, "accounts": account_rows, "account_page": page,
             "account_pages": page_count, "account_count": len(account_ids),
             "promotion_content_available": bool(
-                self.execution_service.scheduled_sticker_available(
-                    (self.execution_service.scheduled_promotion_model() or {}).get("sticker_id")
-                )
+                self.execution_service.scheduled_promotion_model()
+                and (self.execution_service.scheduled_promotion_model() or {}).get("target_configs")
             ),
             "eligible_total": len(eligible), "running_accounts": state_counts["Running"],
             "idle_accounts": state_counts["Waiting"],
@@ -906,6 +991,8 @@ class SchedulerService:
         eligible_ids = set(eligible_by_account)
         self.execution_service.release_scheduled_account_claims(keep=eligible_ids)
         maximum = min(self._concurrency(len(eligible_ids), period), len(eligible_ids))
+        if self.promotion_config().get("execution_mode", "sequential") == "sequential":
+            maximum = min(maximum, 1)
 
         # Retire completed work and start another configured-cycle round.
         for account_id, (campaign_id, task) in list(self._workers.items()):
@@ -1013,11 +1100,15 @@ class SchedulerService:
 
     def _schedulable_campaigns(self) -> list[dict]:
         config = self.promotion_config()
-        target_id = str(config.get("target_id", ""))
-        target = self.execution_service.targets.get(target_id) or {}
+        target_ids = config.get("target_ids") or (
+            [config.get("target_id")] if config.get("target_id") else []
+        )
+        target_ids = list(dict.fromkeys(str(item) for item in target_ids if item))
+        targets = [self.execution_service.targets.get(target_id) or {} for target_id in target_ids]
         model = self.execution_service.scheduled_promotion_model()
-        if (not target_id or target.get("opted_in") is not True or not target.get("username")
-                or model is None):
+        if (not target_ids or any(
+            target.get("opted_in") is not True or not target.get("username") for target in targets
+        ) or model is None):
             return []
         account_ids = sorted(str(item.get("id")) for item in self.account_repository.list()
                              if item.get("id"))
@@ -1026,11 +1117,15 @@ class SchedulerService:
             self.execution_service._update_campaign(SCHEDULED_PROMOTION_ID, {"account_ids": account_ids})
             model = self.execution_service.scheduled_promotion_model() or model
         return [{**model, "id": SCHEDULED_PROMOTION_ID,
-                 "target_ids": [target_id], "account_ids": account_ids}]
+                 "target_ids": target_ids, "account_ids": account_ids,
+                 "execution_mode": config.get("execution_mode", "sequential")}]
 
     def _configured_target_ids(self) -> list[str] | None:
-        target_id = self.promotion_config().get("target_id")
-        return [str(target_id)] if target_id else None
+        config = self.promotion_config()
+        target_ids = config.get("target_ids") or (
+            [config.get("target_id")] if config.get("target_id") else []
+        )
+        return [str(item) for item in target_ids if item] or None
 
     def _reporting_active_now(self) -> bool:
         return bool(self.reporting_service is not None and self._enabled
@@ -1252,7 +1347,8 @@ class SchedulerService:
         if not (1 <= settings.outside_peak_concurrency_1_20 <= 20
                 and 1 <= settings.outside_peak_concurrency_21_50 <= 50
                 and 1 <= settings.outside_peak_concurrency_51_plus
-                and 1 <= settings.peak_concurrency <= 5):
+                and 1 <= settings.peak_concurrency <= 5
+                and 1 <= settings.parallel_target_concurrency <= 5):
             raise ValueError("Scheduler concurrency settings are outside supported limits")
         operating_duration = (
             minute_values["operating_end"] - minute_values["operating_start"]
