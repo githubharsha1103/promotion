@@ -21,6 +21,13 @@ DEFAULT_BAN_PHRASES = (
     "your account is blocked",
     "access to this bot has been denied",
 )
+DEFAULT_DAILY_CHAT_LIMIT_PHRASES = (
+    "Daily chat limit reached",
+    "You have reached your daily chat limit",
+    "Daily limit exceeded",
+    "You can no longer chat today",
+    "Your daily chatting limit is over",
+)
 
 
 def normalize_text(value: str) -> str:
@@ -46,10 +53,29 @@ class BanDetectionResult:
     campaign_id: str | None = None
 
 
+@dataclass(frozen=True)
+class DailyChatLimitDetectionResult:
+    """Structured signal for a target bot's daily chat restriction."""
+
+    detection_id: str
+    account_id: str
+    account_name: str
+    target_id: str
+    target_username: str
+    target_bot_id: int
+    matched_phrase: str
+    original_message: str
+    message_id: int | None
+    detected_at: str
+    campaign_id: str | None = None
+
+
 @dataclass
 class _ClientWatch:
     client: object
-    targets_by_bot_id: dict[int, tuple[str, str, str, object, str | None, object | None, object | None]]
+    targets_by_bot_id: dict[
+        int, tuple[str, str, str, object, str | None, object | None, object | None, object | None, str]
+    ]
     active_bot_ids: set[int]
     handler: object
 
@@ -81,11 +107,22 @@ def is_task_completion_confirmation(value: str) -> bool:
 class BanDetectionEngine:
     """Register one incoming-message handler per client and watch known bots."""
 
-    def __init__(self, phrases: tuple[str, ...] = DEFAULT_BAN_PHRASES) -> None:
-        normalized = tuple((phrase, normalize_text(phrase)) for phrase in phrases if normalize_text(phrase))
-        self._phrases = normalized
+    def __init__(
+        self,
+        phrases: tuple[str, ...] = DEFAULT_BAN_PHRASES,
+        daily_limit_phrases: tuple[str, ...] = DEFAULT_DAILY_CHAT_LIMIT_PHRASES,
+    ) -> None:
+        self._phrases = tuple(
+            (phrase, normalize_text(phrase))
+            for phrase in phrases if normalize_text(phrase)
+        )
+        self._daily_limit_phrases = tuple(
+            (phrase, normalize_text(phrase))
+            for phrase in daily_limit_phrases if normalize_text(phrase)
+        )
         self._watches: dict[int, _ClientWatch] = {}
         self._detected: dict[tuple[str, str], BanDetectionResult] = {}
+        self._daily_detected: dict[tuple[str, str], int] = {}
 
     def result_for(self, account_id: str, target_id: str) -> BanDetectionResult | None:
         return self._detected.get((str(account_id), str(target_id)))
@@ -98,14 +135,17 @@ class BanDetectionEngine:
     def watch_target(
         self, account_id: str, target_id: str, username: str, client, entity,
         on_detected, campaign_id: str | None = None,
-        on_verification=None, on_confirmation=None,
+        on_verification=None, on_confirmation=None, on_daily_limit=None,
+        account_name: str = "Unnamed account",
     ) -> None:
         """Associate a resolved bot and activate it for the current campaign cycle."""
 
         client_key = id(client)
         watch = self._watches.get(client_key)
         if watch is None:
-            targets: dict[int, tuple[str, str, str, object, str | None, object | None, object | None]] = {}
+            targets: dict[
+                int, tuple[str, str, str, object, str | None, object | None, object | None, object | None, str]
+            ] = {}
             active: set[int] = set()
 
             async def handle(event) -> None:
@@ -137,9 +177,38 @@ class BanDetectionEngine:
                             received_monotonic_ns,
                         )
                     return
-                account, target_key, target_username, callback, campaign_id, verification_callback, confirmation_callback = target
+                (
+                    account, target_key, target_username, callback, campaign_id,
+                    verification_callback, confirmation_callback, daily_callback,
+                    saved_account_name,
+                ) = target
 
                 normalized = normalize_text(text)
+                daily_match = next(
+                    (phrase for phrase, candidate in self._daily_limit_phrases
+                     if candidate in normalized),
+                    None,
+                )
+                if daily_match is not None:
+                    key = (account, target_key)
+                    if key not in self._daily_detected:
+                        self._daily_detected[key] = int(event.sender_id)
+                        if daily_callback is not None:
+                            daily_callback(DailyChatLimitDetectionResult(
+                                detection_id=uuid.uuid4().hex,
+                                account_id=account,
+                                account_name=saved_account_name,
+                                target_id=target_key,
+                                target_username=target_username,
+                                target_bot_id=int(event.sender_id),
+                                matched_phrase=daily_match,
+                                original_message=text,
+                                message_id=getattr(event.message, "id", None),
+                                detected_at=datetime.now(timezone.utc).isoformat(),
+                                campaign_id=campaign_id,
+                            ))
+                    return
+
                 matched = next((phrase for phrase, candidate in self._phrases if candidate in normalized), None)
                 if matched is not None:
                     key = (account, target_key)
@@ -200,9 +269,15 @@ class BanDetectionEngine:
         watch.targets_by_bot_id[bot_id] = (
             str(account_id), str(target_id), str(username).lstrip("@"), on_detected,
             str(campaign_id) if campaign_id is not None else None,
-            on_verification, on_confirmation,
+            on_verification, on_confirmation, on_daily_limit, str(account_name),
         )
         watch.active_bot_ids.add(bot_id)
+
+    def clear_daily_limit(self, target_bot_id: int) -> None:
+        """Allow the same account-target pair to report a later daily window."""
+        for key, bot_id in tuple(self._daily_detected.items()):
+            if bot_id == int(target_bot_id):
+                self._daily_detected.pop(key, None)
 
     def stop_watching_target(self, client, entity) -> None:
         watch = self._watches.get(id(client))

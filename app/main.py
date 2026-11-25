@@ -10,8 +10,10 @@ from app.config import get_settings
 from app.control_bot import ControlBotService
 from app.campaigns import CampaignExecutionService
 from app.core.logging_security import TelegramBotTokenRedactionFilter
+from app.daily_limits import DailyChatLimitService
 from app.storage.repositories import AccountRepository
 from app.storage.repositories.campaign_repository import CampaignRepository
+from app.storage.repositories.daily_limit_repository import DailyLimitRepository
 from app.storage.repositories.sticker_repository import StickerRepository
 from app.storage.repositories.target_repository import TargetRepository
 from app.storage.repositories.restriction_repository import RestrictionRepository
@@ -48,6 +50,11 @@ async def lifespan(application: FastAPI):
     account_repository = AccountRepository(settings.records_dir)
     campaign_repository = CampaignRepository(settings.records_dir)
     restriction_service = RestrictionService(RestrictionRepository(settings.records_dir))
+    daily_limit_service = DailyChatLimitService(
+        DailyLimitRepository(settings.records_dir),
+        reset_time=settings.daily_chat_limit_reset_time,
+    )
+    daily_limit_service.load_active()
     campaign_execution = CampaignExecutionService(
         campaign_repository,
         account_repository,
@@ -55,6 +62,7 @@ async def lifespan(application: FastAPI):
         StickerRepository(settings.records_dir),
         client_manager,
         restriction_service=restriction_service,
+        daily_limit_service=daily_limit_service,
     )
     scheduled_reporting = ScheduledReportingService(
         ScheduledReportingRepository(settings.records_dir), campaign_execution, campaign_repository,
@@ -82,6 +90,7 @@ async def lifespan(application: FastAPI):
         scheduler_service.set_report_notifier(control_bot.deliver_scheduled_report)
         scheduler_service.set_recovery_notifier(control_bot.notify_scheduler_recovery)
         restriction_service.set_notifier(control_bot.notify_restriction)
+        daily_limit_service.set_notifier(control_bot.notify_daily_limit)
         application.state.scheduler_service = scheduler_service
         application.state.control_bot_service = control_bot
         restriction_service.load_active()

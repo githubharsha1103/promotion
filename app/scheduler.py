@@ -51,6 +51,7 @@ class SchedulerService:
         self.account_repository = account_repository
         self.execution_service = execution_service
         self.restriction_service = restriction_service
+        self.daily_limit_service = execution_service.daily_limit_service
         self.reporting_service = reporting_service
         self.execution_service.bind_scheduled_promotion_repository(repository)
         stored_config = repository.get_config()
@@ -132,6 +133,8 @@ class SchedulerService:
             self._pending_report_records = {}
         if self.restriction_service is not None:
             self.restriction_service.add_detection_listener(self._restriction_changed)
+        if self.daily_limit_service is not None:
+            self.daily_limit_service.add_detection_listener(self._restriction_changed)
 
     @property
     def settings(self) -> SchedulerSettings:
@@ -463,7 +466,10 @@ class SchedulerService:
         restricted_pairs = self._restricted_pairs([{
             "account_ids": account_ids, "target_ids": target_ids,
         }])
-        restricted_by_account = {str(item["account_id"]): item for item in restricted_pairs}
+        restricted_by_account = {
+            str(item["account_id"]): item for item in restricted_pairs
+            if item.get("status") != "Daily Limit Reached"
+        }
         current = self.status()
         eligible = set(str(item) for item in current.get("eligible_account_ids", [])) & set(account_ids)
         page_count = max(1, (len(account_ids) + page_size - 1) // page_size)
@@ -474,6 +480,17 @@ class SchedulerService:
             account = accounts.get(account_id) or {}
             tasks = tasks_by_account.get(account_id, [])
             worker = active.get(account_id)
+            daily_limits = []
+            if self.daily_limit_service is not None:
+                for target in targets:
+                    daily_record = self.daily_limit_service.active_for(
+                        target.get("telegram_user_id"), str(target.get("username", "")),
+                    )
+                    if daily_record is not None and all(
+                        item.get("id") != daily_record.get("id") for item in daily_limits
+                    ):
+                        daily_limits.append(daily_record)
+            all_targets_daily_limited = bool(target_ids) and len(daily_limits) >= len(target_ids)
             last_error = next((str(task.get("last_error")) for task in sorted(
                 tasks, key=lambda value: str(value.get("updated_at", "")), reverse=True
             ) if task.get("last_error")), None)
@@ -482,6 +499,8 @@ class SchedulerService:
                 account_state = "Waiting"
             elif restriction:
                 account_state = "Restricted"
+            elif all_targets_daily_limited and not worker:
+                account_state = "Daily Limit Reached"
             elif account_id in rate_limited_until:
                 account_state = "Rate Limited"
             elif account.get("authenticated") is not True:
@@ -502,6 +521,14 @@ class SchedulerService:
                 "window_completed_cycles": window_by_account.get(account_id, 0),
                 "last_activity": max((str(task.get("updated_at", "")) for task in tasks), default=None),
                 "last_error": restriction.get("reason") if restriction else last_error,
+                "daily_limits": [
+                    {
+                        "target_username": item.get("target_username", "unknown"),
+                        "matched_phrase": item.get("matched_phrase", ""),
+                        "next_eligibility_at": item.get("next_eligibility_at", ""),
+                    }
+                    for item in daily_limits
+                ],
                 "rate_limit_seconds": max(
                     0, int((rate_limited_until[account_id] - now).total_seconds())
                 ) if account_id in rate_limited_until else None,
@@ -509,7 +536,10 @@ class SchedulerService:
         account_rows = all_account_rows[page * page_size:(page + 1) * page_size]
         state_counts = {
             state: sum(1 for row in all_account_rows if row["status"] == state)
-            for state in ("Running", "Waiting", "Paused", "Restricted", "Rate Limited", "Unavailable")
+            for state in (
+                "Running", "Waiting", "Paused", "Restricted", "Daily Limit Reached",
+                "Rate Limited", "Unavailable",
+            )
         }
         return {
             "configured": True, "promotion": config,
@@ -529,6 +559,7 @@ class SchedulerService:
             "completed_cycles": sum(max(0, int(task.get("successful", 0))) for task in scheduled_tasks),
             "window_completed_cycles": sum(window_by_account.values()),
             "restricted_accounts": state_counts["Restricted"],
+            "daily_limited_accounts": state_counts["Daily Limit Reached"],
             "rate_limited_accounts": state_counts["Rate Limited"],
             "unavailable_accounts": state_counts["Unavailable"],
             "restricted_pairs": restricted_pairs,
@@ -926,6 +957,8 @@ class SchedulerService:
 
     async def _reconcile_once(self) -> None:
         now = datetime.now(ZoneInfo(self._settings.timezone))
+        if self.daily_limit_service is not None:
+            await asyncio.to_thread(self.daily_limit_service.expire_due)
         self._schedule_due_reports(now)
         period = self._period(now)
         if self._shutdown_requested:
@@ -1187,6 +1220,18 @@ class SchedulerService:
                     if target.get("opted_in") is not True:
                         self._record_skip(account_id, "target_not_opted_in", str(target_id))
                         continue
+                    daily_limit = (
+                        self.daily_limit_service.active_for(
+                            target.get("telegram_user_id"), str(target.get("username", "")),
+                        )
+                        if self.daily_limit_service is not None else None
+                    )
+                    if daily_limit is not None:
+                        self._record_skip(
+                            account_id, "daily_chat_limit_active", str(target_id),
+                            str(daily_limit.get("id", "unknown")),
+                        )
+                        continue
                     try:
                         restriction = self.restriction_service.active_for(
                             account_id, str(target_id), target_bot_id=target.get("telegram_user_id"),
@@ -1224,19 +1269,33 @@ class SchedulerService:
             for account_id in campaign.get("account_ids", []):
                 for target_id in campaign.get("target_ids", []):
                     target = self.execution_service.targets.get(str(target_id)) or {}
-                    try:
-                        restriction = self.restriction_service.active_for(
-                            str(account_id), str(target_id), target_bot_id=target.get("telegram_user_id"),
-                            username=target.get("username"),
-                        ) if self.restriction_service is not None else None
-                    except Exception:
-                        restriction = {"status": "unknown"}
+                    daily_limit = (
+                        self.daily_limit_service.active_for(
+                            target.get("telegram_user_id"), str(target.get("username", "")),
+                        )
+                        if self.daily_limit_service is not None else None
+                    )
+                    if daily_limit is not None:
+                        restriction = daily_limit
+                    else:
+                        try:
+                            restriction = self.restriction_service.active_for(
+                                str(account_id), str(target_id),
+                                target_bot_id=target.get("telegram_user_id"),
+                                username=target.get("username"),
+                            ) if self.restriction_service is not None else None
+                        except Exception:
+                            restriction = {"status": "unknown"}
                     if restriction is not None:
                         key = (str(account_id), str(target_id))
                         pairs_by_key[key] = {
                             "account_id": key[0], "target_id": key[1],
                             "status": restriction.get("status", "restricted"),
-                            "reason": restriction.get("detection_reason") or restriction.get("reason"),
+                            "reason": (
+                                restriction.get("detection_reason")
+                                or restriction.get("matched_phrase")
+                                or restriction.get("reason")
+                            ),
                         }
         return list(pairs_by_key.values())
 

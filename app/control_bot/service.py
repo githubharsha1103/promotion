@@ -116,6 +116,9 @@ class ControlBotService:
         self.auth_service = auth_service
         self.client_manager = client_manager
         self.campaign_execution = campaign_execution
+        self.daily_limit_service = (
+            campaign_execution.daily_limit_service if campaign_execution is not None else None
+        )
         self.scheduler_service = scheduler_service
         self.reporting_service = reporting_service
         self._application: Application | None = None
@@ -557,6 +560,24 @@ class ControlBotService:
         )
         await self._application.bot.send_message(chat_id=self.settings.admin_id, text=text)
 
+    async def notify_daily_limit(self, record: dict) -> None:
+        """Notify the owner once when a target enters its daily limit window."""
+        if self._application is None or self.settings.admin_id is None:
+            raise RuntimeError("Control bot is unavailable for owner notifications")
+        detected_at = self._format_dashboard_datetime(record.get("detected_at")) or "unavailable"
+        next_eligibility = (
+            self._format_dashboard_datetime(record.get("next_eligibility_at")) or "unavailable"
+        )
+        text = (
+            "⏳ Daily Limit Reached\n"
+            f"Account: {record.get('account_name') or 'Unnamed account'}\n"
+            f"Target bot: @{str(record.get('target_username') or 'unknown').lstrip('@')}\n"
+            f"Matched phrase: {record.get('matched_phrase') or 'unavailable'}\n"
+            f"Detected: {detected_at}\n"
+            f"Expected reset: {next_eligibility}"
+        )
+        await self._application.bot.send_message(chat_id=self.settings.admin_id, text=text)
+
     async def notify_normal_campaign_suspended(self, detail: dict) -> None:
         """Notify the owner after scheduled priority safely suspends a normal account worker."""
         if self._application is None or self.settings.admin_id is None:
@@ -836,6 +857,7 @@ class ControlBotService:
             "Waiting": "🟡 Idle / Waiting",
             "Paused": "⏸️ Paused",
             "Restricted": "🚫 Restricted",
+            "Daily Limit Reached": "⏳ Daily Limit Reached",
             "Rate Limited": "⏳ Rate Limited",
             "Unavailable": "🔴 Offline",
         }
@@ -853,6 +875,8 @@ class ControlBotService:
                 reason = f"Telegram wait remaining: {self._format_duration(row['rate_limit_seconds'])}"
             elif row["status"] == "Paused":
                 reason = "Promotion paused by owner"
+            elif row["status"] == "Daily Limit Reached":
+                reason = "All configured targets are temporarily at their daily chat limit"
             elif row["status"] == "Waiting":
                 current_status = data.get("status", {})
                 if current_status.get("recovery_required"):
@@ -867,6 +891,13 @@ class ControlBotService:
                 reason = row.get("last_error")
             if reason:
                 lines.append(f"Reason: {reason}")
+            for limit in row.get("daily_limits", []):
+                reset = self._format_dashboard_datetime(limit.get("next_eligibility_at"))
+                lines.append(
+                    f"Daily Limit Reached · @{str(limit.get('target_username') or 'unknown').lstrip('@')}"
+                    + (f" · phrase: {limit.get('matched_phrase')}" if limit.get("matched_phrase") else "")
+                    + (f" · eligible {reset}" if reset else "")
+                )
         if not accounts:
             lines.append("\nNo accounts are available for this promotion.")
         rows = []
@@ -890,7 +921,10 @@ class ControlBotService:
     async def _show_promotion_restrictions(self, query, page: int = 0) -> None:
         try:
             records = sorted(
-                self.restriction_repository.list(),
+                self.restriction_repository.list() + (
+                    self.daily_limit_service.all_records()
+                    if self.daily_limit_service is not None else []
+                ),
                 key=lambda item: str(item.get("detected_at", "")),
                 reverse=True,
             )
@@ -912,18 +946,28 @@ class ControlBotService:
         selected = records[page * page_size:(page + 1) * page_size]
         lines = ["🚫 Promotion Restrictions"]
         for record in selected:
-            account_name = self._restriction_account_label(str(record.get("account_id", "")))
+            account_name = str(
+                record.get("account_name")
+                or self._restriction_account_label(str(record.get("account_id", "")))
+            )
             target_name = str(record.get("target_username") or "unknown").lstrip("@")
             lines.append(f"\n{account_name} → @{target_name}")
-            reason = record.get("detection_reason")
+            reason = record.get("matched_phrase") if record.get("record_type") == "daily_chat_limit" else record.get("detection_reason")
             if reason:
-                lines.append(f"Reason: {reason}")
+                lines.append(
+                    f"Matched phrase: {reason}" if record.get("record_type") == "daily_chat_limit"
+                    else f"Reason: {reason}"
+                )
             lines.append(f"Status: {str(record.get('status') or 'active').title()}")
             detected = self._format_dashboard_datetime(
                 record.get("detected_at") or record.get("created_at")
             )
             if detected:
                 lines.append(f"Detected: {detected}")
+            if record.get("record_type") == "daily_chat_limit":
+                reset = self._format_dashboard_datetime(record.get("next_eligibility_at"))
+                if reset:
+                    lines.append(f"Next eligibility: {reset}")
         if not selected:
             lines.append("\nNo promotion restrictions are recorded.")
         rows = []
@@ -1159,6 +1203,8 @@ class ControlBotService:
         self._dashboard_sections[chat_id] = "restrictions"
         try:
             records = self.restriction_repository.list()
+            if self.daily_limit_service is not None:
+                records.extend(self.daily_limit_service.all_records())
         except Exception as exc:
             logger.warning("Could not read account restrictions (error=%s)", type(exc).__name__)
             await query.edit_message_text(
@@ -1245,6 +1291,8 @@ class ControlBotService:
         chat_id = query.message.chat_id if query.message is not None else 0
         try:
             record = self.restriction_repository.get(record_id)
+            if record is None and self.daily_limit_service is not None:
+                record = self.daily_limit_service.repository.get(record_id)
         except Exception as exc:
             logger.warning("Could not read account restriction details (error=%s)", type(exc).__name__)
             record = None
@@ -1252,6 +1300,28 @@ class ControlBotService:
             await query.edit_message_text("This restriction is unavailable or has been removed.")
             return
         account_label = self._restriction_account_label(str(record.get("account_id", "")))
+        if record.get("record_type") == "daily_chat_limit":
+            detected = self._format_dashboard_datetime(record.get("detected_at")) or "unavailable"
+            reset = self._format_dashboard_datetime(record.get("next_eligibility_at")) or "unavailable"
+            await query.edit_message_text(
+                "\n".join([
+                    "Daily chat limit details",
+                    f"Status: {record.get('status', 'Daily Limit Reached')}",
+                    f"Account: {record.get('account_name') or account_label}",
+                    f"Target bot: @{str(record.get('target_username') or 'unknown').lstrip('@')}",
+                    f"Target Telegram user ID: {record.get('target_bot_id', 'unavailable')}",
+                    f"Matched phrase: {record.get('matched_phrase', 'unavailable')}",
+                    f"Detected at: {detected}",
+                    f"Next eligibility: {reset}",
+                    f"Original message: {str(record.get('original_message') or '')[:1000] or 'unavailable'}",
+                ]),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Refresh", callback_data=f"r:view:{record_id}"),
+                    InlineKeyboardButton("Restrictions", callback_data="r:list:0"),
+                    InlineKeyboardButton("Home", callback_data="dash:home"),
+                ]]),
+            )
+            return
         lines = [
             "Account restriction details",
             f"Status: {record.get('status', 'active')}",

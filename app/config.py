@@ -30,6 +30,8 @@ class Settings(BaseSettings):
         "you are banned|you have been banned|you are temporarily banned|you cannot use this bot|"
         "your account is blocked|access to this bot has been denied"
     )
+    daily_chat_limit_phrases: str = ""
+    daily_chat_limit_reset_time: str = "00:00"
 
     telegram_api_id: int | None = Field(
         default=None, validation_alias=AliasChoices("TELEGRAM_API_ID", "API_ID")

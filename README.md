@@ -50,6 +50,8 @@ The application reads settings from environment variables and the project `.env`
 
 Set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` in `.env` for MTProto access; the aliases `API_ID` and `API_HASH` are also accepted. Set `CONTROL_BOT_TOKEN` to the centralized Telegram Bot API token and `ADMIN_ID` to the owner's numeric Telegram user ID. `ADMIN_ID` is parsed as a positive integer; usernames are never used for authorization. The control bot remains disabled unless both settings are supplied. Application and storage paths are loaded from environment variables and `.env`.
 
+Daily chat-limit detection always includes the built-in phrases. Add optional phrases to `DAILY_CHAT_LIMIT_PHRASES` separated by `|`. `DAILY_CHAT_LIMIT_RESET_TIME` sets the daily eligibility time in 24-hour `HH:MM` format (IST; defaults to `00:00`).
+
 Storage paths can be overridden with `DATA_DIR`, `SESSIONS_DIR`, `RECORDS_DIR`, `MEDIA_DIR`, `STICKERS_DIR`, `IMAGES_DIR`, `VIDEOS_DIR`, `DOCUMENTS_DIR`, `EXPORTS_DIR`, `BACKUPS_DIR`, `BACKUP_STAGING_DIR`, `LOGS_DIR`, `APPLICATION_LOGS_DIR`, and `TELEGRAM_LOGS_DIR`. These are VPS filesystem paths. Keep this data on persistent storage and restrict access to session and credential files. `.gitignore` excludes credentials, session state, JSON records, media, exports, backups, logs, and common key files while preserving directory layouts with `.gitkeep` files.
 
 ## Local storage layout
