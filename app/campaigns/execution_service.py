@@ -523,6 +523,59 @@ class CampaignExecutionService:
         return [item for item in self._task_store(str(campaign_id)).list()
                 if item.get("campaign_id") == str(campaign_id)]
 
+    def _restart_completed_campaign(self, campaign: dict) -> None:
+        campaign_id = str(campaign["id"])
+        tasks = self.task_records(campaign_id)
+        history = list(campaign.get("run_history") or [])
+        history.append({
+            "completed_at": campaign.get("updated_at"),
+            "progress": dict(campaign.get("progress") or {}),
+            "tasks": [dict(task) for task in tasks],
+        })
+        task_store = self._task_store(campaign_id)
+        configured_pairs = {
+            (str(account_id), str(target_id))
+            for account_id in campaign.get("account_ids", [])
+            for target_id in campaign.get("target_ids", [])
+        }
+        for task in tasks:
+            if (str(task.get("account_id", "")), str(task.get("target_id", ""))) not in configured_pairs:
+                continue
+            task_store.update(task["id"], {
+                "next_cycle": 1,
+                "current_cycle": None,
+                "successful": 0,
+                "failed": 0,
+                "restricted": 0,
+                "status": "pending",
+                "phase": "idle",
+                "search_started": False,
+                "last_error": None,
+                "restriction_reason": None,
+                "restriction_id": None,
+                "daily_limit_record_id": None,
+                "daily_limit_until": None,
+                "updated_at": self._now(),
+            })
+        self._update_campaign(campaign_id, {
+            "run_history": history,
+            "progress": {
+                "completed": 0, "successful": 0, "failed": 0,
+                "restricted": 0,
+                "total": int(campaign["total_cycles"])
+                * len(campaign["account_ids"])
+                * len(campaign["target_ids"]),
+            },
+            "current_account_id": None,
+            "current_target_id": None,
+            "current_cycle": None,
+            "pause_requested": False,
+            "stop_requested": False,
+            "suspended_accounts": [],
+            "suspension_reasons": {},
+            "normal_suspension_checkpoints": {},
+        })
+
     def clear_detected_restriction(self, account_id: str, target_id: str) -> None:
         """Clear the in-memory detector latch after the owner clears its record."""
 
@@ -602,11 +655,16 @@ class CampaignExecutionService:
     async def start(self, campaign_id: str, callback=None) -> bool:
         async with self._guard:
             campaign = await self._storage_io(self._validated_campaign, campaign_id)
-            if campaign is None or campaign.get("status") in {"running", "completed", "suspended"}:
+            if campaign is None or campaign.get("status") in {"running", "suspended"}:
                 return False
             runtime = self._runtimes.get(campaign_id)
             if runtime is not None and runtime.task is not None and not runtime.task.done():
                 return False
+            if campaign.get("status") == "completed":
+                await self._storage_io(self._restart_completed_campaign, campaign)
+                campaign = await self._storage_io(self._validated_campaign, campaign_id)
+                if campaign is None:
+                    return False
             runtime = _Runtime(callback=callback)
             self._runtimes[campaign_id] = runtime
             await self._storage_io(self._ensure_tasks, campaign)
