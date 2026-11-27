@@ -484,7 +484,8 @@ class SchedulerService:
             if self.daily_limit_service is not None:
                 for target in targets:
                     daily_record = self.daily_limit_service.active_for(
-                        target.get("telegram_user_id"), str(target.get("username", "")),
+                        account_id, target.get("telegram_user_id"),
+                        str(target.get("username", "")),
                     )
                     if daily_record is not None and all(
                         item.get("id") != daily_record.get("id") for item in daily_limits
@@ -1222,7 +1223,8 @@ class SchedulerService:
                         continue
                     daily_limit = (
                         self.daily_limit_service.active_for(
-                            target.get("telegram_user_id"), str(target.get("username", "")),
+                            account_id, target.get("telegram_user_id"),
+                            str(target.get("username", "")),
                         )
                         if self.daily_limit_service is not None else None
                     )
@@ -1271,7 +1273,8 @@ class SchedulerService:
                     target = self.execution_service.targets.get(str(target_id)) or {}
                     daily_limit = (
                         self.daily_limit_service.active_for(
-                            target.get("telegram_user_id"), str(target.get("username", "")),
+                            str(account_id), target.get("telegram_user_id"),
+                            str(target.get("username", "")),
                         )
                         if self.daily_limit_service is not None else None
                     )

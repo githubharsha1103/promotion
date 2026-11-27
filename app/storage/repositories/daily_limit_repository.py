@@ -1,4 +1,4 @@
-"""Persistent target-wide daily chat limit records."""
+"""Persistent account-target daily chat limit records."""
 
 from datetime import datetime
 import hashlib
@@ -16,12 +16,15 @@ class DailyLimitRepository(JsonRepository):
         super().__init__(records_dir)
 
     @staticmethod
-    def record_id(target_bot_id: int | str | None, username: str, next_eligibility_at: str) -> str:
+    def record_id(
+        target_bot_id: int | str | None, username: str,
+        next_eligibility_at: str, account_id: str = "",
+    ) -> str:
         target_key = (
             f"bot:{target_bot_id}" if target_bot_id is not None
             else f"username:{str(username).casefold().lstrip('@')}"
         )
-        identity = f"{target_key}\0{next_eligibility_at}"
+        identity = f"{account_id}\0{target_key}\0{next_eligibility_at}"
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
     def record_detection(self, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -29,7 +32,7 @@ class DailyLimitRepository(JsonRepository):
         saved["id"] = self.record_id(
             saved.get("target_bot_id"),
             str(saved.get("target_username", "")),
-            str(saved["next_eligibility_at"]),
+            str(saved["next_eligibility_at"]), str(saved.get("account_id", "")),
         )
         return self.create_if_absent(saved)
 

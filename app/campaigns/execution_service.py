@@ -708,6 +708,7 @@ class CampaignExecutionService:
                     for task in tasks
                 }
                 unfinished = False
+                daily_limited = False
                 for account_id in account_ids:
                     for target_id in campaign["target_ids"]:
                         task = task_by_pair.get((str(account_id), str(target_id)))
@@ -719,18 +720,20 @@ class CampaignExecutionService:
                         target = self.targets.get(str(target_id)) or {}
                         daily_limit = (
                             self.daily_limit_service.active_for(
-                                target.get("telegram_user_id"), str(target.get("username", "")),
+                                str(account_id), target.get("telegram_user_id"),
+                                str(target.get("username", "")),
                             )
                             if self.daily_limit_service is not None else None
                         )
                         if task.get("status") != "daily_limit_reached" or daily_limit is None:
                             unfinished = True
                             break
+                        daily_limited = True
                     if unfinished:
                         break
                 if unfinished:
                     status, operation = "failed", "incomplete: one or more campaign tasks did not reach a terminal cycle"
-                elif any(task.get("status") == "daily_limit_reached" for task in tasks):
+                elif daily_limited:
                     status, operation = "completed", "complete with cycles skipped due to daily limit"
                 else:
                     status, operation = "completed", "complete"
@@ -898,7 +901,8 @@ class CampaignExecutionService:
                     continue
                 daily_limit = (
                     self.daily_limit_service.active_for(
-                        target.get("telegram_user_id"), str(target.get("username", "")),
+                        account_id, target.get("telegram_user_id"),
+                        str(target.get("username", "")),
                     )
                     if self.daily_limit_service is not None else None
                 )
@@ -1065,12 +1069,12 @@ class CampaignExecutionService:
         target = await self._storage_io(self.targets.get, str(target_id)) or {}
         username = str(target.get("username", "unknown"))
         target_bot_id = getattr(entity, "id", target.get("telegram_user_id"))
-        daily_event = self._daily_limit_event(target_bot_id, username)
+        daily_event = self._daily_limit_event(account_id, target_bot_id, username)
         await self._set_current_async(campaign_id, account_id, target_id, cycle, "searching")
         current_task = await self._task_for_async(campaign_id, account_id, target_id) or task
         resume_phase = str(current_task.get("verification_resume_phase") or "search")
         try:
-            await self._raise_if_daily_limited_async(target_bot_id, username)
+            await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
             await self._raise_if_target_opted_out_async(target_id)
             await self._raise_if_banned_async(account_id, target_id)
             self._raise_if_verification_paused(account_id, target_id, campaign_id)
@@ -1083,11 +1087,11 @@ class CampaignExecutionService:
                 await self._set_task_async(campaign, account_id, target_id, {
                     "phase": "search_pending", "search_started": True,
                 })
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_target_opted_out_async(target_id)
                 await client.send_message(entity, "/search")
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "search")
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
                 await self._set_task_async(campaign, account_id, target_id, {
@@ -1115,14 +1119,14 @@ class CampaignExecutionService:
                 sticker = await self._storage_io(
                     self.stickers.get, str(content["sticker_id"]),
                 ) or {}
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_target_opted_out_async(target_id)
                 await client.send_file(
                     entity, str(sticker_path),
                     attributes=self._sticker_attributes(sticker, sticker_path),
                 )
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "sticker")
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
                 await self._set_task_async(campaign, account_id, target_id, {
@@ -1148,11 +1152,11 @@ class CampaignExecutionService:
                 await self._set_current_async(
                     campaign_id, account_id, target_id, cycle, "sending message",
                 )
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_target_opted_out_async(target_id)
                 await client.send_message(entity, promotion_text)
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "promotion_message")
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
                 await self._set_task_async(campaign, account_id, target_id, {
@@ -1173,11 +1177,11 @@ class CampaignExecutionService:
                     campaign, account_id, target_id,
                     {"phase": "stop_pending", "search_started": True},
                 )
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_target_opted_out_async(target_id)
                 await client.send_message(entity, "/stop")
                 self._record_scheduled_operation(campaign_id, account_id, target_id, cycle, "stop")
-                await self._raise_if_daily_limited_async(target_bot_id, username)
+                await self._raise_if_daily_limited_async(account_id, target_bot_id, username)
                 await self._raise_if_banned_async(account_id, target_id)
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)
                 await self._set_task_async(campaign, account_id, target_id, {
@@ -1193,9 +1197,9 @@ class CampaignExecutionService:
             await self._notify(runtime, await self._get_async(campaign_id))
             return True
         except _TargetDailyLimitReached:
-            await self._await_daily_limit_persistence(target_bot_id, username)
+            await self._await_daily_limit_persistence(account_id, target_bot_id, username)
             limit_record = (
-                self.daily_limit_service.active_for(target_bot_id, username)
+                self.daily_limit_service.active_for(account_id, target_bot_id, username)
                 if self.daily_limit_service is not None else None
             )
             if limit_record is not None:
@@ -1265,12 +1269,12 @@ class CampaignExecutionService:
                 campaign, account_id, target_id, {"flood_wait_seconds": wait_seconds},
             )
             daily_limit = await self._wait_for_daily_limit(
-                wait_seconds, daily_event, target_bot_id, username,
+                wait_seconds, daily_event, account_id, target_bot_id, username,
             )
             if daily_limit is not None:
-                await self._await_daily_limit_persistence(target_bot_id, username)
+                await self._await_daily_limit_persistence(account_id, target_bot_id, username)
                 latest_limit = self.daily_limit_service.active_for(
-                    target_bot_id, username,
+                    account_id, target_bot_id, username,
                 ) if self.daily_limit_service is not None else daily_limit
                 if latest_limit is not None:
                     await self._mark_daily_limit_task_async(task, latest_limit)
@@ -2208,12 +2212,12 @@ class CampaignExecutionService:
             except RuntimeError:
                 logger.exception("Could not schedule restriction persistence (detection_id=%s)", result.detection_id)
 
-    def _daily_limit_event(self, target_bot_id, username: str) -> asyncio.Event:
+    def _daily_limit_event(self, account_id: str, target_bot_id, username: str) -> asyncio.Event:
         keys = (
-            self.daily_limit_service.target_keys(target_bot_id, username)
+            self.daily_limit_service.target_keys(target_bot_id, username, account_id)
             if self.daily_limit_service is not None
-            else (f"bot:{target_bot_id}",) if target_bot_id is not None
-            else (f"username:{str(username).casefold().lstrip('@')}",)
+            else (f"account:{account_id}:bot:{target_bot_id}",) if target_bot_id is not None
+            else (f"account:{account_id}:username:{str(username).casefold().lstrip('@')}",)
         )
         key = keys[0]
         return self._daily_limit_events.setdefault(key, asyncio.Event())
@@ -2221,6 +2225,7 @@ class CampaignExecutionService:
     def _daily_limit_changed(self, record: dict) -> None:
         keys = DailyChatLimitService.target_keys(
             record.get("target_bot_id"), str(record.get("target_username", "")),
+            str(record.get("account_id", "")),
         )
         if record.get("status") == "Daily Limit Reached":
             for key in keys:
@@ -2235,7 +2240,9 @@ class CampaignExecutionService:
             self.ban_detection.clear_daily_limit(int(bot_id))
 
     def _signal_daily_limit(self, result: DailyChatLimitDetectionResult) -> None:
-        event = self._daily_limit_event(result.target_bot_id, result.target_username)
+        event = self._daily_limit_event(
+            result.account_id, result.target_bot_id, result.target_username,
+        )
         event.set()
         if self.daily_limit_service is None:
             logger.error(
@@ -2275,21 +2282,25 @@ class CampaignExecutionService:
                 record_id, type(error).__name__,
             )
 
-    async def _await_daily_limit_persistence(self, target_bot_id, username: str) -> None:
+    async def _await_daily_limit_persistence(
+        self, account_id: str, target_bot_id, username: str,
+    ) -> None:
         if self.daily_limit_service is None:
             return
-        record = self.daily_limit_service.active_for(target_bot_id, username)
+        record = self.daily_limit_service.active_for(account_id, target_bot_id, username)
         if record is None:
             return
         task = self._daily_limit_tasks.get(str(record.get("id", "")))
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
 
-    async def _raise_if_daily_limited_async(self, target_bot_id, username: str) -> None:
+    async def _raise_if_daily_limited_async(
+        self, account_id: str, target_bot_id, username: str,
+    ) -> None:
         if self.daily_limit_service is None:
             return
-        record = self.daily_limit_service.active_for(target_bot_id, username)
-        keys = self.daily_limit_service.target_keys(target_bot_id, username)
+        record = self.daily_limit_service.active_for(account_id, target_bot_id, username)
+        keys = self.daily_limit_service.target_keys(target_bot_id, username, account_id)
         event = self._daily_limit_events.get(keys[0]) if keys else None
         if record is not None:
             if event is not None:
@@ -2299,7 +2310,8 @@ class CampaignExecutionService:
             event.clear()
 
     async def _wait_for_daily_limit(
-        self, seconds: int, event: asyncio.Event, target_bot_id, username: str,
+        self, seconds: int, event: asyncio.Event, account_id: str,
+        target_bot_id, username: str,
     ) -> dict | None:
         if self.daily_limit_service is None:
             await asyncio.sleep(seconds)
@@ -2309,7 +2321,7 @@ class CampaignExecutionService:
                 await asyncio.wait_for(event.wait(), timeout=seconds)
             except asyncio.TimeoutError:
                 return None
-        return self.daily_limit_service.active_for(target_bot_id, username)
+        return self.daily_limit_service.active_for(account_id, target_bot_id, username)
 
     async def _mark_daily_limit_task_async(self, task: dict, record: dict) -> None:
         campaign_id = str(task.get("campaign_id", ""))
@@ -2368,7 +2380,7 @@ class CampaignExecutionService:
         if daily_limit_event.is_set():
             target = await self._storage_io(self.targets.get, str(target_id)) or {}
             await self._raise_if_daily_limited_async(
-                target.get("telegram_user_id"), str(target.get("username", "")),
+                account_id, target.get("telegram_user_id"), str(target.get("username", "")),
             )
         if verification_event.is_set():
             self._raise_if_verification_paused(account_id, target_id, campaign_id)
@@ -2391,7 +2403,7 @@ class CampaignExecutionService:
             if daily_limit_event.is_set():
                 target = await self._storage_io(self.targets.get, str(target_id)) or {}
                 await self._raise_if_daily_limited_async(
-                    target.get("telegram_user_id"), str(target.get("username", "")),
+                    account_id, target.get("telegram_user_id"), str(target.get("username", "")),
                 )
             if verification_event.is_set():
                 self._raise_if_verification_paused(account_id, target_id, campaign_id)

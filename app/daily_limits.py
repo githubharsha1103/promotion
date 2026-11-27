@@ -17,7 +17,7 @@ DailyLimitListener = Callable[[dict], None]
 
 
 class DailyChatLimitService:
-    """Track one active daily limit per target bot, independent of account."""
+    """Track active daily limits for each account and target bot."""
 
     def __init__(
         self,
@@ -41,13 +41,16 @@ class DailyChatLimitService:
         return time(hour, minute)
 
     @staticmethod
-    def target_keys(target_bot_id: int | str | None, username: str) -> tuple[str, ...]:
+    def target_keys(
+        target_bot_id: int | str | None, username: str, account_id: str = "",
+    ) -> tuple[str, ...]:
         keys = []
+        account_key = f"account:{str(account_id)}:"
         if target_bot_id is not None:
-            keys.append(f"bot:{target_bot_id}")
+            keys.append(f"{account_key}bot:{target_bot_id}")
         normalized_username = str(username or "").casefold().lstrip("@")
         if normalized_username:
-            keys.append(f"username:{normalized_username}")
+            keys.append(f"{account_key}username:{normalized_username}")
         return tuple(keys)
 
     def add_detection_listener(self, listener: DailyLimitListener) -> None:
@@ -64,9 +67,11 @@ class DailyChatLimitService:
             if record.get("status") == "Daily Limit Reached":
                 self._cache_active(record, notify=False)
 
-    def active_for(self, target_bot_id: int | str | None, username: str) -> dict | None:
+    def active_for(
+        self, account_id: str, target_bot_id: int | str | None, username: str,
+    ) -> dict | None:
         now = datetime.now(_IST)
-        for key in self.target_keys(target_bot_id, username):
+        for key in self.target_keys(target_bot_id, username, account_id):
             record = self._active_by_key.get(key)
             if record is None:
                 continue
@@ -111,7 +116,7 @@ class DailyChatLimitService:
         }
         record["id"] = self.repository.record_id(
             record["target_bot_id"], record["target_username"],
-            record["next_eligibility_at"],
+            record["next_eligibility_at"], record["account_id"],
         )
         self._cache_active(record)
         return record
@@ -153,6 +158,7 @@ class DailyChatLimitService:
         for record in expired:
             for key in self.target_keys(
                 record.get("target_bot_id"), str(record.get("target_username", "")),
+                str(record.get("account_id", "")),
             ):
                 if self._active_by_key.get(key, {}).get("id") == record.get("id"):
                     self._active_by_key.pop(key, None)
@@ -161,6 +167,7 @@ class DailyChatLimitService:
     def _cache_active(self, record: dict, *, notify: bool = True) -> None:
         for key in self.target_keys(
             record.get("target_bot_id"), str(record.get("target_username", "")),
+            str(record.get("account_id", "")),
         ):
             self._active_by_key[key] = record
         if notify:
