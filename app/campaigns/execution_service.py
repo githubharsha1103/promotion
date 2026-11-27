@@ -701,7 +701,39 @@ class CampaignExecutionService:
             elif runtime.suspended_accounts or (latest.get("suspended_accounts") or []):
                 status, operation = "suspended", "suspended for scheduled priority"
             else:
-                status, operation = "completed", "complete"
+                tasks = await self._storage_io(self.task_records, campaign_id)
+                total_cycles = int(campaign.get("total_cycles", 1))
+                task_by_pair = {
+                    (str(task.get("account_id", "")), str(task.get("target_id", ""))): task
+                    for task in tasks
+                }
+                unfinished = False
+                for account_id in account_ids:
+                    for target_id in campaign["target_ids"]:
+                        task = task_by_pair.get((str(account_id), str(target_id)))
+                        if task is None:
+                            unfinished = True
+                            break
+                        if int(task.get("next_cycle", 1)) > total_cycles:
+                            continue
+                        target = self.targets.get(str(target_id)) or {}
+                        daily_limit = (
+                            self.daily_limit_service.active_for(
+                                target.get("telegram_user_id"), str(target.get("username", "")),
+                            )
+                            if self.daily_limit_service is not None else None
+                        )
+                        if task.get("status") != "daily_limit_reached" or daily_limit is None:
+                            unfinished = True
+                            break
+                    if unfinished:
+                        break
+                if unfinished:
+                    status, operation = "failed", "incomplete: one or more campaign tasks did not reach a terminal cycle"
+                elif any(task.get("status") == "daily_limit_reached" for task in tasks):
+                    status, operation = "completed", "complete with cycles skipped due to daily limit"
+                else:
+                    status, operation = "completed", "complete"
             await self._refresh_progress_async(campaign_id, status=status, operation=operation)
             await self._notify(runtime, await self._get_async(campaign_id))
         except asyncio.CancelledError:
